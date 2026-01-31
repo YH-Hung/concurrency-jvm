@@ -25,7 +25,8 @@ public class ExecutorConfig {
 
     private ExecutorConfig(Builder builder) {
         this.concurrency = builder.concurrency;
-        this.corePoolSize = builder.corePoolSize;
+        // Default corePoolSize to concurrency if not explicitly set (sentinel value -1)
+        this.corePoolSize = builder.corePoolSize >= 0 ? builder.corePoolSize : builder.concurrency;
         // Default maxPoolSize to concurrency if not explicitly set
         this.maxPoolSize = builder.maxPoolSize != null ? builder.maxPoolSize : builder.concurrency;
         this.queueCapacity = builder.queueCapacity;
@@ -95,7 +96,7 @@ public class ExecutorConfig {
 
     public static class Builder {
         private int concurrency = 10;
-        private int corePoolSize = 0;
+        private int corePoolSize = -1; // -1 means default to concurrency
         private Integer maxPoolSize = null; // null means default to concurrency
         private int queueCapacity = 1000;
         private Duration taskTimeout = Duration.ofMinutes(5);
@@ -129,7 +130,10 @@ public class ExecutorConfig {
          * <p>A value of 0 means threads are created on demand and allowed
          * to terminate when idle (after the keep-alive time).
          * 
-         * Default: 0
+         * <p>If not set, defaults to the concurrency value to ensure
+         * full thread utilization from the start.
+         * 
+         * Default: same as concurrency
          */
         public Builder corePoolSize(int corePoolSize) {
             if (corePoolSize < 0) {
@@ -223,13 +227,14 @@ public class ExecutorConfig {
         }
 
         public ExecutorConfig build() {
-            // Determine effective maxPoolSize (defaults to concurrency if not set)
+            // Determine effective values (defaults to concurrency if not set)
+            int effectiveCorePoolSize = corePoolSize >= 0 ? corePoolSize : concurrency;
             int effectiveMaxPoolSize = maxPoolSize != null ? maxPoolSize : concurrency;
             
             // Validate pool size constraints
-            if (effectiveMaxPoolSize < corePoolSize) {
+            if (effectiveMaxPoolSize < effectiveCorePoolSize) {
                 throw new IllegalArgumentException(
-                    "maxPoolSize (" + effectiveMaxPoolSize + ") must be >= corePoolSize (" + corePoolSize + ")");
+                    "maxPoolSize (" + effectiveMaxPoolSize + ") must be >= corePoolSize (" + effectiveCorePoolSize + ")");
             }
             
             return new ExecutorConfig(this);

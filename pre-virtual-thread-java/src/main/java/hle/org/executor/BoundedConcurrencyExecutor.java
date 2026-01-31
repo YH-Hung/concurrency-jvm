@@ -1,8 +1,9 @@
 package hle.org.executor;
 
+import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -59,15 +60,20 @@ import java.util.stream.Collectors;
 public class BoundedConcurrencyExecutor implements AutoCloseable {
 
     private final ExecutorService workerPool;
+    private final ScheduledExecutorService timeoutScheduler;
     private final Semaphore concurrencyLimiter;
     private final BlockingQueue<Runnable> workQueue;
     private final ExecutorConfig config;
     private final AtomicBoolean shutdown = new AtomicBoolean(false);
     
+    // Counter for auto-generated task IDs (separate from submittedCount to avoid race condition)
+    private final AtomicLong autoTaskIdCounter = new AtomicLong(0);
+    
     // Statistics
     private final AtomicLong submittedCount = new AtomicLong(0);
     private final AtomicLong completedCount = new AtomicLong(0);
     private final AtomicLong failedCount = new AtomicLong(0);
+    private final AtomicLong timedOutCount = new AtomicLong(0);
     private final AtomicInteger activeCount = new AtomicInteger(0);
 
     /**
@@ -112,6 +118,13 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
         threadPool.allowCoreThreadTimeOut(true);
         
         this.workerPool = threadPool;
+        
+        // Create a single-threaded scheduler for task timeout enforcement
+        this.timeoutScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, config.getThreadNamePrefix() + "-timeout-scheduler");
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     /**
@@ -157,8 +170,12 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
      * @param task the task to execute
      * @param <T> the return type of the task
      * @return a CompletableFuture that will contain the TaskResult
+     * @throws NullPointerException if taskId or task is null
      */
     public <T> CompletableFuture<TaskResult<T>> submit(String taskId, Supplier<T> task) {
+        Objects.requireNonNull(taskId, "taskId cannot be null");
+        Objects.requireNonNull(task, "task cannot be null");
+        
         if (shutdown.get()) {
             return CompletableFuture.completedFuture(
                 TaskResult.failure(taskId, new RejectedExecutionException("Executor is shutdown"),
@@ -168,12 +185,19 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
 
         submittedCount.incrementAndGet();
         CompletableFuture<TaskResult<T>> future = new CompletableFuture<>();
+        final Thread[] executingThread = new Thread[1];
+        final Instant[] startTimeHolder = new Instant[1];
 
         Runnable wrappedTask = () -> {
-            Instant startTime = Instant.now();
+            Instant queuedTime = Instant.now();
             try {
                 // Acquire semaphore to respect concurrency limit
                 concurrencyLimiter.acquire();
+                
+                // Capture actual execution start time (after semaphore wait)
+                Instant startTime = Instant.now();
+                startTimeHolder[0] = startTime;
+                executingThread[0] = Thread.currentThread();
                 activeCount.incrementAndGet();
                 
                 try {
@@ -191,6 +215,7 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+                Instant startTime = startTimeHolder[0] != null ? startTimeHolder[0] : queuedTime;
                 future.complete(TaskResult.failure(taskId, e, startTime, Instant.now()));
                 failedCount.incrementAndGet();
             }
@@ -198,6 +223,27 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
 
         try {
             workerPool.execute(wrappedTask);
+            
+            // Schedule timeout enforcement if configured
+            Duration timeout = config.getTaskTimeout();
+            if (timeout != null && !timeout.isZero() && !timeout.isNegative()) {
+                timeoutScheduler.schedule(() -> {
+                    if (!future.isDone()) {
+                        TimeoutException timeoutEx = new TimeoutException(
+                            "Task " + taskId + " exceeded timeout of " + timeout);
+                        Instant startTime = startTimeHolder[0] != null ? startTimeHolder[0] : Instant.now();
+                        if (future.complete(TaskResult.failure(taskId, timeoutEx, startTime, Instant.now()))) {
+                            timedOutCount.incrementAndGet();
+                            failedCount.incrementAndGet();
+                            // Interrupt the executing thread if it's still running
+                            Thread thread = executingThread[0];
+                            if (thread != null) {
+                                thread.interrupt();
+                            }
+                        }
+                    }
+                }, timeout.toMillis(), TimeUnit.MILLISECONDS);
+            }
         } catch (RejectedExecutionException e) {
             future.complete(TaskResult.failure(taskId, e, Instant.now(), Instant.now()));
             failedCount.incrementAndGet();
@@ -208,9 +254,11 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
 
     /**
      * Submits a task with an auto-generated task ID.
+     * 
+     * @throws NullPointerException if task is null
      */
     public <T> CompletableFuture<TaskResult<T>> submit(Supplier<T> task) {
-        return submit("task-" + submittedCount.get(), task);
+        return submit("task-" + autoTaskIdCounter.incrementAndGet(), task);
     }
 
     /**
@@ -252,7 +300,7 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
      * Waits for all futures to complete with a timeout.
      */
     public <T> List<TaskResult<T>> awaitAll(List<CompletableFuture<TaskResult<T>>> futures, 
-                                             java.time.Duration timeout) throws TimeoutException {
+                                             Duration timeout) throws TimeoutException {
         try {
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
                 .get(timeout.toMillis(), TimeUnit.MILLISECONDS);
@@ -301,6 +349,13 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
     }
 
     /**
+     * Gets the total number of tasks that timed out.
+     */
+    public long getTimedOutCount() {
+        return timedOutCount.get();
+    }
+
+    /**
      * Gets the available permits in the concurrency limiter.
      */
     public int getAvailablePermits() {
@@ -312,8 +367,8 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
      */
     public String getStats() {
         return String.format(
-            "BoundedExecutor[submitted=%d, completed=%d, failed=%d, active=%d, queued=%d, permits=%d/%d]",
-            submittedCount.get(), completedCount.get(), failedCount.get(),
+            "BoundedExecutor[submitted=%d, completed=%d, failed=%d, timedOut=%d, active=%d, queued=%d, permits=%d/%d]",
+            submittedCount.get(), completedCount.get(), failedCount.get(), timedOutCount.get(),
             activeCount.get(), getQueueSize(), 
             getAvailablePermits(), config.getConcurrency()
         );
@@ -342,7 +397,7 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
      * Blocks until all tasks have completed execution after a shutdown request,
      * or the timeout occurs.
      */
-    public boolean awaitTermination(java.time.Duration timeout) throws InterruptedException {
+    public boolean awaitTermination(Duration timeout) throws InterruptedException {
         return workerPool.awaitTermination(timeout.toMillis(), TimeUnit.MILLISECONDS);
     }
 
@@ -363,12 +418,16 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
     @Override
     public void close() {
         shutdown();
+        timeoutScheduler.shutdown();
         try {
-            if (!awaitTermination(java.time.Duration.ofSeconds(30))) {
+            if (!awaitTermination(Duration.ofSeconds(30))) {
                 shutdownNow();
             }
+            // Also wait for timeout scheduler to terminate
+            timeoutScheduler.awaitTermination(5, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             shutdownNow();
+            timeoutScheduler.shutdownNow();
             Thread.currentThread().interrupt();
         }
     }

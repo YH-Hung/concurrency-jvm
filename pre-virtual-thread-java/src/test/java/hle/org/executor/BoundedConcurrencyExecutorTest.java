@@ -364,14 +364,14 @@ class BoundedConcurrencyExecutorTest {
     }
 
     @Test
-    void shouldDefaultMaxPoolSizeToConcurrency() {
+    void shouldDefaultPoolSizesToConcurrency() {
         ExecutorConfig config = ExecutorConfig.builder()
             .concurrency(15)
             .build();
         
         assertEquals(15, config.getConcurrency());
         assertEquals(15, config.getMaxPoolSize());  // Should default to concurrency
-        assertEquals(0, config.getCorePoolSize());  // Should default to 0
+        assertEquals(15, config.getCorePoolSize());  // Should default to concurrency (not 0)
     }
 
     @Test
@@ -405,5 +405,120 @@ class BoundedConcurrencyExecutorTest {
         List<TaskResult<String>> results = executor.awaitAll(futures);
         assertEquals(20, results.size());
         assertTrue(results.stream().allMatch(TaskResult::isSuccess));
+    }
+
+    @Test
+    @Timeout(10)
+    void shouldEnforceTaskTimeout() throws Exception {
+        // Configure with a short timeout
+        executor = new BoundedConcurrencyExecutor(
+            ExecutorConfig.builder()
+                .concurrency(2)
+                .taskTimeout(Duration.ofMillis(200))
+                .build()
+        );
+
+        // Submit a task that takes longer than the timeout
+        CompletableFuture<TaskResult<String>> future = executor.submit("slow-task", () -> {
+            try {
+                Thread.sleep(5000); // Much longer than timeout
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Interrupted");
+            }
+            return "should not reach here";
+        });
+
+        // Wait for result - should be a timeout failure
+        TaskResult<String> result = future.get(5, TimeUnit.SECONDS);
+        
+        assertTrue(result.isFailure());
+        assertTrue(result.getException().isPresent());
+        assertTrue(result.getException().get() instanceof TimeoutException);
+        assertEquals(1, executor.getTimedOutCount());
+    }
+
+    @Test
+    void shouldRejectNullTaskId() {
+        executor = new BoundedConcurrencyExecutor();
+
+        assertThrows(NullPointerException.class, () -> 
+            executor.submit(null, () -> "test")
+        );
+    }
+
+    @Test
+    void shouldRejectNullTask() {
+        executor = new BoundedConcurrencyExecutor();
+
+        assertThrows(NullPointerException.class, () -> 
+            executor.submit("task-id", null)
+        );
+    }
+
+    @Test
+    void shouldGenerateUniqueAutoTaskIds() throws Exception {
+        executor = new BoundedConcurrencyExecutor(
+            ExecutorConfig.builder()
+                .concurrency(10)
+                .build()
+        );
+
+        // Submit multiple tasks without explicit IDs
+        List<CompletableFuture<TaskResult<String>>> futures = new ArrayList<>();
+        for (int i = 0; i < 100; i++) {
+            futures.add(executor.submit(() -> "result"));
+        }
+
+        List<TaskResult<String>> results = executor.awaitAll(futures);
+        
+        // Collect all task IDs and verify they are unique
+        java.util.Set<String> taskIds = results.stream()
+            .map(TaskResult::getTaskId)
+            .collect(java.util.stream.Collectors.toSet());
+        
+        assertEquals(100, taskIds.size(), "All task IDs should be unique");
+    }
+
+    @Test
+    void shouldMeasureActualExecutionTime() throws Exception {
+        executor = new BoundedConcurrencyExecutor(
+            ExecutorConfig.builder()
+                .concurrency(1) // Only 1 concurrent, so second task waits
+                .build()
+        );
+
+        // First task holds the semaphore for 200ms
+        CompletableFuture<TaskResult<String>> first = executor.submit("first", () -> {
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return "first";
+        });
+
+        // Wait a bit then submit second task - it will wait for semaphore
+        Thread.sleep(50);
+        
+        CompletableFuture<TaskResult<String>> second = executor.submit("second", () -> {
+            try {
+                Thread.sleep(100); // Actual execution: 100ms
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return "second";
+        });
+
+        // Get results
+        first.get();
+        TaskResult<String> secondResult = second.get();
+
+        // The second task's duration should be ~100ms (execution time), 
+        // not ~250ms (queue wait + execution time)
+        // Allow some tolerance for test flakiness
+        long duration = secondResult.getDuration().toMillis();
+        assertTrue(duration < 200, 
+            "Duration should reflect execution time (~100ms), not queue wait time. Actual: " + duration + "ms");
     }
 }

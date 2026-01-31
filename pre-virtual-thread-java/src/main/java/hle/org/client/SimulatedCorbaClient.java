@@ -1,7 +1,9 @@
 package hle.org.client;
 
-import java.util.Random;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -21,13 +23,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class SimulatedCorbaClient implements RemoteClient<String, String> {
 
     private static final AtomicInteger GLOBAL_REQUEST_COUNT = new AtomicInteger(0);
+    private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
     
     private final String id;
     private final String endpoint;
     private final long minLatencyMs;
     private final long maxLatencyMs;
     private final double failureRate;
-    private final Random random;
     private final AtomicBoolean connected;
     private final AtomicInteger requestCount;
     private final boolean verbose;
@@ -56,7 +58,6 @@ public class SimulatedCorbaClient implements RemoteClient<String, String> {
         this.minLatencyMs = minLatencyMs;
         this.maxLatencyMs = maxLatencyMs;
         this.failureRate = failureRate;
-        this.random = new Random();
         this.connected = new AtomicBoolean(true);
         this.requestCount = new AtomicInteger(0);
         this.verbose = verbose;
@@ -82,7 +83,10 @@ public class SimulatedCorbaClient implements RemoteClient<String, String> {
         }
 
         // Simulate blocking I/O with configurable latency
-        long latency = minLatencyMs + (long) (random.nextDouble() * (maxLatencyMs - minLatencyMs));
+        long latencyRange = maxLatencyMs - minLatencyMs;
+        long latency = latencyRange > 0 
+                ? minLatencyMs + ThreadLocalRandom.current().nextLong(latencyRange + 1)
+                : minLatencyMs;
         try {
             Thread.sleep(latency);
         } catch (InterruptedException e) {
@@ -91,7 +95,7 @@ public class SimulatedCorbaClient implements RemoteClient<String, String> {
         }
 
         // Simulate random failures
-        if (random.nextDouble() < failureRate) {
+        if (ThreadLocalRandom.current().nextDouble() < failureRate) {
             String errorMsg = String.format("Simulated CORBA error for request: %s", request);
             if (verbose) {
                 log("FAILED: " + errorMsg);
@@ -166,7 +170,7 @@ public class SimulatedCorbaClient implements RemoteClient<String, String> {
 
     private void log(String message) {
         System.out.println(String.format("[%s][%s] %s", 
-                java.time.LocalTime.now().toString().substring(0, 12),
+                LocalTime.now().format(TIME_FORMATTER),
                 id, message));
     }
 

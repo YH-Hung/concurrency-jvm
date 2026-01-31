@@ -2,8 +2,11 @@ package hle.org.pool;
 
 import org.apache.commons.pool2.impl.GenericObjectPool;
 import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -40,6 +43,8 @@ import java.util.function.Supplier;
  */
 public class ResourcePool<R extends PooledResource<?>> implements AutoCloseable {
 
+    private static final Logger logger = LoggerFactory.getLogger(ResourcePool.class);
+    
     private final GenericObjectPool<R> internalPool;
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
@@ -91,8 +96,11 @@ public class ResourcePool<R extends PooledResource<?>> implements AutoCloseable 
      * @param <T> the return type of the operation
      * @return the result of the operation
      * @throws ResourcePoolException if the resource cannot be borrowed or the operation fails
+     * @throws NullPointerException if operation is null
      */
     public <T> T execute(Function<R, T> operation) {
+        Objects.requireNonNull(operation, "operation cannot be null");
+        
         if (closed.get()) {
             throw new ResourcePoolException("Pool is closed");
         }
@@ -124,8 +132,12 @@ public class ResourcePool<R extends PooledResource<?>> implements AutoCloseable 
      * @param operation the operation to execute
      * @param <T> the return type
      * @return the result of the operation
+     * @throws NullPointerException if timeout or operation is null
      */
     public <T> T executeWithTimeout(Duration timeout, Function<R, T> operation) {
+        Objects.requireNonNull(timeout, "timeout cannot be null");
+        Objects.requireNonNull(operation, "operation cannot be null");
+        
         if (closed.get()) {
             throw new ResourcePoolException("Pool is closed");
         }
@@ -157,13 +169,14 @@ public class ResourcePool<R extends PooledResource<?>> implements AutoCloseable 
                 // Invalidate the resource if it's no longer valid
                 try {
                     internalPool.invalidateObject(resource);
-                } catch (Exception ignored) {
+                } catch (Exception e) {
                     // Best effort - resource will be destroyed
+                    logger.warn("Failed to invalidate resource: {}", e.getMessage());
                 }
             }
         } catch (Exception e) {
             // Log but don't throw - we don't want to mask the original exception
-            System.err.println("Warning: Failed to return resource to pool: " + e.getMessage());
+            logger.warn("Failed to return resource to pool: {}", e.getMessage());
         }
     }
 

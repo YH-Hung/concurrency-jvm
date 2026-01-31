@@ -106,8 +106,11 @@ public final class TaskResult<T> {
             return String.format("TaskResult[taskId=%s, success=true, value=%s, duration=%dms]",
                     taskId, value, getDuration().toMillis());
         } else {
+            String errorMessage = exception != null 
+                    ? (exception.getMessage() != null ? exception.getMessage() : exception.getClass().getSimpleName())
+                    : "unknown error";
             return String.format("TaskResult[taskId=%s, success=false, error=%s, duration=%dms]",
-                    taskId, exception.getMessage(), getDuration().toMillis());
+                    taskId, errorMessage, getDuration().toMillis());
         }
     }
 }

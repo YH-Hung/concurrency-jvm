@@ -8,8 +8,10 @@ import hle.org.pool.ResourcePool;
 import hle.org.pool.ResourcePoolConfig;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
@@ -113,9 +115,12 @@ public class PooledExecutorService<R extends PooledResource<T>, T> implements Au
      * @param operation the operation to perform with the resource
      * @param <V> the return type of the operation
      * @return a future containing the task result
+     * @throws NullPointerException if taskId or operation is null
      */
     public <V> CompletableFuture<TaskResult<V>> executeAsync(String taskId, 
                                                               Function<R, V> operation) {
+        Objects.requireNonNull(taskId, "taskId cannot be null");
+        Objects.requireNonNull(operation, "operation cannot be null");
         return executor.submit(taskId, () -> resourcePool.execute(operation));
     }
 
@@ -126,13 +131,13 @@ public class PooledExecutorService<R extends PooledResource<T>, T> implements Au
      * @param operation the operation to perform with the resource
      * @param <V> the return type of the operation
      * @return the task result
+     * @throws NullPointerException if taskId or operation is null
      */
     public <V> TaskResult<V> execute(String taskId, Function<R, V> operation) {
         try {
             return executeAsync(taskId, operation).get();
         } catch (Exception e) {
-            return TaskResult.failure(taskId, e, 
-                    java.time.Instant.now(), java.time.Instant.now());
+            return TaskResult.failure(taskId, e, Instant.now(), Instant.now());
         }
     }
 
@@ -201,6 +206,16 @@ public class PooledExecutorService<R extends PooledResource<T>, T> implements Au
     @Override
     public void close() {
         executor.close();
+        // Wait for borrowed resources to be returned before closing the pool (with timeout)
+        long deadline = System.currentTimeMillis() + 5000;
+        while (resourcePool.getActiveCount() > 0 && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
         resourcePool.close();
     }
 
