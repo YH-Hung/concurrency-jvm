@@ -83,6 +83,8 @@ System.out.println("Completed: " + successCount + "/" + results.size());
 service.close();
 ```
 
+Async variants are also available: `executeAsync()` and `executeAllAsync()` return `CompletableFuture` results, and `executeAll(operations, timeout)` enforces a batch timeout.
+
 ### 2. Using Components Separately
 
 ```java
@@ -114,28 +116,42 @@ for (Request req : requests) {
 List<TaskResult<String>> results = executor.awaitAll(futures);
 ```
 
+If you need a per-borrow timeout at the pool level, use `pool.executeWithTimeout(Duration, operation)`. The executor also supports `submit(Supplier)` for auto-generated task IDs and `submitAll(TaskSubmission)` for batch submissions.
+
 ### 3. Implementing Your Own PooledResource
 
 ```java
-public class MyCorbaClient implements RemoteClient<Request, Response> {
+public class MyCorbaClient implements RemoteClient<Request, String> {
     private final String id = UUID.randomUUID().toString();
+    private final String endpoint;
     private final ORB orb;
     private final MyService service;
     private boolean connected = true;
 
     public MyCorbaClient(String endpoint) {
+        this.endpoint = endpoint;
         this.orb = ORB.init(args, null);
         this.service = // ... CORBA setup
     }
 
     @Override
-    public Response execute(Request request) {
+    public String execute(Request request) {
         return service.invoke(request);  // Blocking CORBA call
     }
 
     @Override
     public boolean isValid() {
         return connected && orb != null;
+    }
+
+    @Override
+    public String getEndpoint() {
+        return endpoint;
+    }
+
+    @Override
+    public boolean isConnected() {
+        return connected;
     }
 
     @Override
@@ -241,6 +257,9 @@ public class CorbaServiceManager {
 | `maxWaitTime` | 30s | Time to wait for a resource |
 | `maxIdleTime` | 5min | Idle time before eviction |
 | `testOnBorrow` | true | Validate before use |
+| `testOnReturn` | false | Validate before returning to the pool |
+| `testWhileIdle` | true | Validate idle resources periodically |
+| `timeBetweenEvictionRuns` | 30s | How often to run idle eviction |
 | `blockWhenExhausted` | true | Block vs fail when exhausted |
 
 ### ExecutorConfig
@@ -248,6 +267,8 @@ public class CorbaServiceManager {
 | Option | Default | Description |
 |--------|---------|-------------|
 | `concurrency` | 10 | Max parallel task executions |
+| `corePoolSize` | 10 | Minimum executor threads (defaults to concurrency) |
+| `maxPoolSize` | 10 | Maximum executor threads (defaults to concurrency) |
 | `queueCapacity` | 1000 | Max pending tasks |
 | `taskTimeout` | 5min | Max time per task |
 | `rejectionPolicy` | BLOCK | BLOCK, REJECT, or CALLER_RUNS |
@@ -268,12 +289,13 @@ This solution prevents thread starvation through several mechanisms:
 
 ## Requirements
 
-- Java 17 (works with Java 8+ with minor syntax adjustments)
+- Java 17 (configured in `pom.xml`)
 - Maven 3.6+
 
 ## Dependencies
 
 - Apache Commons Pool2 (for resource pooling)
+- SLF4J (API + Simple runtime logger)
 - JUnit 5 (for testing)
 
 ## Project Structure
