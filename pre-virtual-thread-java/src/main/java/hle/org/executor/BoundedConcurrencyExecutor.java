@@ -95,15 +95,23 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
         RejectedExecutionHandler rejectionHandler = createRejectionHandler();
         
         // Use ThreadPoolExecutor for fine-grained control
-        // The pool size equals concurrency because the semaphore controls actual parallelism
-        this.workerPool = new ThreadPoolExecutor(
-            config.getConcurrency(),
-            config.getConcurrency(),
+        // corePoolSize: minimum threads kept alive (even when idle)
+        // maxPoolSize: maximum threads allowed (should be >= concurrency for full utilization)
+        // The semaphore controls actual task parallelism independently of thread pool size
+        ThreadPoolExecutor threadPool = new ThreadPoolExecutor(
+            config.getCorePoolSize(),
+            config.getMaxPoolSize(),
             60L, TimeUnit.SECONDS,
             workQueue,
             threadFactory,
             rejectionHandler
         );
+        
+        // Allow core threads to time out when idle, enabling the pool to shrink
+        // This is especially important when corePoolSize < maxPoolSize
+        threadPool.allowCoreThreadTimeOut(true);
+        
+        this.workerPool = threadPool;
     }
 
     /**
@@ -118,17 +126,24 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
             case BLOCK:
                 // Block until space is available - this is the default for preventing overload
                 return (r, executor) -> {
-                    if (!executor.isShutdown()) {
-                        try {
-                            executor.getQueue().put(r);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            throw new RejectedExecutionException("Interrupted while waiting for queue space", e);
-                        }
+                    if (executor.isShutdown()) {
+                        throw new RejectedExecutionException("Executor is shutdown");
+                    }
+                    try {
+                        executor.getQueue().put(r);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new RejectedExecutionException("Interrupted while waiting for queue space", e);
                     }
                 };
             case CALLER_RUNS:
-                return new ThreadPoolExecutor.CallerRunsPolicy();
+                return (r, executor) -> {
+                    if (executor.isShutdown()) {
+                         throw new RejectedExecutionException("Executor is shutdown");
+                    }
+                    // Run in caller thread
+                    r.run();
+                };
             case REJECT:
             default:
                 return new ThreadPoolExecutor.AbortPolicy();

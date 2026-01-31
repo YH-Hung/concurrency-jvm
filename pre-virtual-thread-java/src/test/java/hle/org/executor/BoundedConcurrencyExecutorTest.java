@@ -314,4 +314,96 @@ class BoundedConcurrencyExecutorTest {
         
         assertThrows(IllegalStateException.class, result::getOrThrow);
     }
+
+    @Test
+    @Timeout(10)
+    void shouldSupportSeparatePoolSizeConfiguration() throws Exception {
+        // Configure with separate corePoolSize, maxPoolSize, and concurrency
+        int corePoolSize = 2;
+        int maxPoolSize = 10;
+        int concurrency = 5;  // Semaphore permits - actual concurrency limit
+        
+        executor = new BoundedConcurrencyExecutor(
+            ExecutorConfig.builder()
+                .corePoolSize(corePoolSize)
+                .maxPoolSize(maxPoolSize)
+                .concurrency(concurrency)
+                .queueCapacity(1000)
+                .build()
+        );
+
+        AtomicInteger maxConcurrent = new AtomicInteger(0);
+        AtomicInteger currentConcurrent = new AtomicInteger(0);
+
+        // Submit many tasks
+        List<CompletableFuture<TaskResult<Integer>>> futures = new ArrayList<>();
+        for (int i = 0; i < 50; i++) {
+            futures.add(executor.submit("task-" + i, () -> {
+                int concurrent = currentConcurrent.incrementAndGet();
+                maxConcurrent.updateAndGet(max -> Math.max(max, concurrent));
+                try {
+                    Thread.sleep(50); // Hold for a bit
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                currentConcurrent.decrementAndGet();
+                return concurrent;
+            }));
+        }
+
+        // Wait for all tasks
+        List<TaskResult<Integer>> results = executor.awaitAll(futures);
+
+        // All should complete successfully
+        assertEquals(50, results.size());
+        assertTrue(results.stream().allMatch(TaskResult::isSuccess));
+
+        // Max concurrent should not exceed concurrency limit (semaphore permits)
+        assertTrue(maxConcurrent.get() <= concurrency,
+            "Max concurrent was " + maxConcurrent.get() + " but concurrency limit is " + concurrency);
+    }
+
+    @Test
+    void shouldDefaultMaxPoolSizeToConcurrency() {
+        ExecutorConfig config = ExecutorConfig.builder()
+            .concurrency(15)
+            .build();
+        
+        assertEquals(15, config.getConcurrency());
+        assertEquals(15, config.getMaxPoolSize());  // Should default to concurrency
+        assertEquals(0, config.getCorePoolSize());  // Should default to 0
+    }
+
+    @Test
+    void shouldValidatePoolSizeConstraints() {
+        // maxPoolSize must be >= corePoolSize
+        assertThrows(IllegalArgumentException.class, () -> 
+            ExecutorConfig.builder()
+                .corePoolSize(10)
+                .maxPoolSize(5)  // Invalid: less than corePoolSize
+                .build()
+        );
+    }
+
+    @Test
+    @Timeout(10)
+    void shouldWorkWithZeroCorePoolSize() throws Exception {
+        // Test that corePoolSize=0 still processes tasks correctly
+        executor = new BoundedConcurrencyExecutor(
+            ExecutorConfig.builder()
+                .corePoolSize(0)
+                .maxPoolSize(5)
+                .concurrency(5)
+                .build()
+        );
+
+        List<CompletableFuture<TaskResult<String>>> futures = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            futures.add(executor.submit("task-" + i, () -> "result"));
+        }
+
+        List<TaskResult<String>> results = executor.awaitAll(futures);
+        assertEquals(20, results.size());
+        assertTrue(results.stream().allMatch(TaskResult::isSuccess));
+    }
 }

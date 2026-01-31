@@ -15,6 +15,8 @@ import java.time.Duration;
 public class ExecutorConfig {
 
     private final int concurrency;
+    private final int corePoolSize;
+    private final int maxPoolSize;
     private final int queueCapacity;
     private final Duration taskTimeout;
     private final boolean daemon;
@@ -23,6 +25,9 @@ public class ExecutorConfig {
 
     private ExecutorConfig(Builder builder) {
         this.concurrency = builder.concurrency;
+        this.corePoolSize = builder.corePoolSize;
+        // Default maxPoolSize to concurrency if not explicitly set
+        this.maxPoolSize = builder.maxPoolSize != null ? builder.maxPoolSize : builder.concurrency;
         this.queueCapacity = builder.queueCapacity;
         this.taskTimeout = builder.taskTimeout;
         this.daemon = builder.daemon;
@@ -40,6 +45,20 @@ public class ExecutorConfig {
 
     public int getConcurrency() {
         return concurrency;
+    }
+
+    /**
+     * Gets the core (minimum) number of threads to keep in the pool.
+     */
+    public int getCorePoolSize() {
+        return corePoolSize;
+    }
+
+    /**
+     * Gets the maximum number of threads allowed in the pool.
+     */
+    public int getMaxPoolSize() {
+        return maxPoolSize;
     }
 
     public int getQueueCapacity() {
@@ -76,6 +95,8 @@ public class ExecutorConfig {
 
     public static class Builder {
         private int concurrency = 10;
+        private int corePoolSize = 0;
+        private Integer maxPoolSize = null; // null means default to concurrency
         private int queueCapacity = 1000;
         private Duration taskTimeout = Duration.ofMinutes(5);
         private boolean daemon = false;
@@ -98,6 +119,41 @@ public class ExecutorConfig {
                 throw new IllegalArgumentException("concurrency must be >= 1");
             }
             this.concurrency = concurrency;
+            return this;
+        }
+
+        /**
+         * Sets the core (minimum) number of threads to keep in the pool,
+         * even when they are idle.
+         * 
+         * <p>A value of 0 means threads are created on demand and allowed
+         * to terminate when idle (after the keep-alive time).
+         * 
+         * Default: 0
+         */
+        public Builder corePoolSize(int corePoolSize) {
+            if (corePoolSize < 0) {
+                throw new IllegalArgumentException("corePoolSize must be >= 0");
+            }
+            this.corePoolSize = corePoolSize;
+            return this;
+        }
+
+        /**
+         * Sets the maximum number of threads allowed in the pool.
+         * 
+         * <p>This should typically be >= concurrency to ensure enough threads
+         * are available to fully utilize the concurrency limit.
+         * 
+         * <p>If not set, defaults to the concurrency value.
+         * 
+         * Default: same as concurrency
+         */
+        public Builder maxPoolSize(int maxPoolSize) {
+            if (maxPoolSize < 1) {
+                throw new IllegalArgumentException("maxPoolSize must be >= 1");
+            }
+            this.maxPoolSize = maxPoolSize;
             return this;
         }
 
@@ -167,6 +223,15 @@ public class ExecutorConfig {
         }
 
         public ExecutorConfig build() {
+            // Determine effective maxPoolSize (defaults to concurrency if not set)
+            int effectiveMaxPoolSize = maxPoolSize != null ? maxPoolSize : concurrency;
+            
+            // Validate pool size constraints
+            if (effectiveMaxPoolSize < corePoolSize) {
+                throw new IllegalArgumentException(
+                    "maxPoolSize (" + effectiveMaxPoolSize + ") must be >= corePoolSize (" + corePoolSize + ")");
+            }
+            
             return new ExecutorConfig(this);
         }
     }

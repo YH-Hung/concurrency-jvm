@@ -103,7 +103,9 @@ public class ResourcePool<R extends PooledResource<?>> implements AutoCloseable 
             resource = internalPool.borrowObject();
             return operation.apply(resource);
         } catch (Exception e) {
-            valid = false;
+            // Note: We do not set valid=false here. We rely on resource.isValid() in returnResource
+            // to determine if the resource should be invalidated. This allows reusing resources
+            // even if the operation failed due to business logic errors.
             if (e instanceof ResourcePoolException) {
                 throw (ResourcePoolException) e;
             }
@@ -134,7 +136,8 @@ public class ResourcePool<R extends PooledResource<?>> implements AutoCloseable 
             resource = internalPool.borrowObject(timeout.toMillis());
             return operation.apply(resource);
         } catch (Exception e) {
-            valid = false;
+            // Note: We do not set valid=false here. We rely on resource.isValid() in returnResource
+            // to determine if the resource should be invalidated.
             if (e instanceof ResourcePoolException) {
                 throw (ResourcePoolException) e;
             }
