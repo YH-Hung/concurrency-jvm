@@ -1,0 +1,28 @@
+.DS_Store
+
+# Java
+*.class
+*.log
+*.jar
+*.war
+*.ear
+
+# Maven
+**/target/
+**/dependency-reduced-pom.xml
+
+# IntelliJ
+.idea/
+*.iml
+
+# VS Code
+.vscode/
+
+# Metals
+.metals/
+**/.bloop/
+**/.metals/
+
+# OS
+.AppleDouble
+.LSOverride
