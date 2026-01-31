@@ -1,50 +1,65 @@
 package hle.org;
 
-import org.apache.commons.pool2.PooledObjectFactory;
-import org.apache.commons.pool2.impl.GenericObjectPool;
-import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
+/**
+ * A generic resource pool interface that manages borrowing and releasing of pooled resources.
+ *
+ * @param <T> the type of resource managed by this pool
+ */
+public interface ResourcePool<T> extends AutoCloseable {
 
-public final class ResourcePool<T> implements AutoCloseable {
-    private final GenericObjectPool<T> pool;
-    private final GenericObjectPoolConfig<T> config;
+    /**
+     * Borrows a resource from the pool.
+     *
+     * @return a resource from the pool
+     * @throws Exception if the resource cannot be borrowed
+     */
+    T borrow() throws Exception;
 
-    public ResourcePool(PooledObjectFactory<T> factory, GenericObjectPoolConfig<T> config) {
-        this.config = config;
-        this.pool = new GenericObjectPool<>(factory, config);
-    }
+    /**
+     * Releases a resource back to the pool.
+     *
+     * @param resource the resource to release (may be null, in which case this is a no-op)
+     */
+    void release(T resource);
 
-    public T borrow() throws Exception {
-        return pool.borrowObject();
-    }
+    /**
+     * Returns the number of currently active (borrowed) resources.
+     *
+     * @return the number of active resources
+     */
+    int getNumActive();
 
-    public void release(T resource) {
-        if (resource != null) {
-            pool.returnObject(resource);
-        }
-    }
+    /**
+     * Returns the number of idle resources in the pool.
+     *
+     * @return the number of idle resources
+     */
+    int getNumIdle();
 
-    public int getNumActive() {
-        return pool.getNumActive();
-    }
+    /**
+     * Returns the maximum total number of resources allowed in the pool.
+     *
+     * @return the maximum total resources
+     */
+    int getMaxTotal();
 
-    public int getNumIdle() {
-        return pool.getNumIdle();
-    }
+    /**
+     * Returns the maximum number of idle resources allowed in the pool.
+     *
+     * @return the maximum idle resources
+     */
+    int getMaxIdle();
 
-    public int getMaxTotal() {
-        return config.getMaxTotal();
-    }
+    /**
+     * Returns the minimum number of idle resources to maintain in the pool.
+     *
+     * @return the minimum idle resources
+     */
+    int getMinIdle();
 
-    public int getMaxIdle() {
-        return config.getMaxIdle();
-    }
-
-    public int getMinIdle() {
-        return config.getMinIdle();
-    }
-
+    /**
+     * Closes the pool and releases all resources.
+     */
     @Override
-    public void close() {
-        pool.close();
-    }
+    void close();
 }

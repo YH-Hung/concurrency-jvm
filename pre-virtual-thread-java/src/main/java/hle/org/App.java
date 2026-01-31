@@ -1,7 +1,5 @@
 package hle.org;
 
-import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
-
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
@@ -48,16 +46,18 @@ public final class App {
             concurrency = requests;
         }
 
-        GenericObjectPoolConfig<SimulatedResource> config = new GenericObjectPoolConfig<>();
-        config.setMaxTotal(poolSize);
-        config.setMaxIdle(maxIdle);
-        config.setMinIdle(minIdle);
-        config.setBlockWhenExhausted(true);
-        config.setMaxWait(Duration.ofSeconds(30));
+        ResourcePoolConfig config = ResourcePoolConfig.builder()
+                .maxTotal(poolSize)
+                .maxIdle(maxIdle)
+                .minIdle(minIdle)
+                .blockWhenExhausted(true)
+                .maxWait(Duration.ofSeconds(30))
+                .build();
 
-        try (ResourcePool<SimulatedResource> pool = new ResourcePool<>(new SimulatedResourceFactory(), config)) {
-            RequestRunner runner = new RequestRunner(pool);
-            RunResult result = runner.run(requests, concurrency, queueSize, sleepMs, cpuIterations);
+        try (ResourcePool<SimulatedResource> pool = new Acp2ResourcePool<>(new SimulatedResourceFactory(), config)) {
+            RequestRunner<SimulatedResource> runner = new RequestRunner<>(pool);
+            RunResult result = runner.run(requests, concurrency, queueSize,
+                    resource -> resource.perform(sleepMs, cpuIterations));
             printSummary(requests, concurrency, poolSize, queueSize, sleepMs, cpuIterations, minIdle, maxIdle, result);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
