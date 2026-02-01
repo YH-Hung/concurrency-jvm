@@ -215,10 +215,18 @@ public class VirtualPooledService<R extends PooledResource<T>, T> implements Aut
         
         try (var scope = StructuredTaskScope.open(Joiner.<TaskResult<V>>allSuccessfulOrThrow())) {
             for (OperationSubmission<R, V> op : operations) {
-                scope.fork(() -> executeWithPool(op.getTaskId(), op.getOperation()));
+                scope.fork(() -> {
+                    TaskResult<V> result = executeWithPool(op.getTaskId(), op.getOperation());
+                    if (result.isFailure()) {
+                        Throwable t = result.getException().orElse(new RuntimeException("Task failed: " + op.getTaskId()));
+                        if (t instanceof Exception e) throw e;
+                        throw new RuntimeException(t);
+                    }
+                    return result;
+                });
             }
             
-            return scope.join().map(Subtask::get).toList();
+            return scope.join().map(subtask -> subtask.get()).toList();
         } catch (Throwable t) {
             if (t instanceof Exception e) throw e;
             throw new RuntimeException(t);

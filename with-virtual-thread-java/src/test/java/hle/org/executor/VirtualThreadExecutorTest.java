@@ -400,6 +400,73 @@ class VirtualThreadExecutorTest {
     }
 
     @Test
+    void shouldHandleAwaitAllTimeout() throws Exception {
+        executor = new VirtualThreadExecutor();
+
+        List<CompletableFuture<TaskResult<String>>> futures = new ArrayList<>();
+        futures.add(executor.submit("slow", () -> {
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return "done";
+        }));
+
+        assertThrows(TimeoutException.class, () -> 
+            executor.awaitAll(futures, Duration.ofMillis(100))
+        );
+    }
+
+    @Test
+    void shouldHandleShutdownNow() throws Exception {
+        executor = new VirtualThreadExecutor();
+
+        CompletableFuture<TaskResult<String>> future = executor.submit("to-be-cancelled", () -> {
+            try {
+                Thread.sleep(5000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("interrupted");
+            }
+            return "done";
+        });
+
+        // Give it a moment to start
+        Thread.sleep(100);
+
+        List<Runnable> neverStarted = executor.shutdownNow();
+        assertTrue(executor.isShutdown());
+        
+        // The task should be interrupted
+        TaskResult<String> result = future.get(1, TimeUnit.SECONDS);
+        assertTrue(result.isFailure());
+    }
+
+    @Test
+    void shouldHandleInterruptionDuringAwaitAll() throws Exception {
+        executor = new VirtualThreadExecutor();
+        
+        List<CompletableFuture<TaskResult<String>>> futures = new ArrayList<>();
+        futures.add(new CompletableFuture<>());
+        
+        Thread testThread = Thread.currentThread();
+        new Thread(() -> {
+            try {
+                Thread.sleep(200);
+                testThread.interrupt();
+            } catch (InterruptedException e) {}
+        }).start();
+
+        assertThrows(RuntimeException.class, () -> 
+            executor.awaitAll(futures, Duration.ofSeconds(5))
+        );
+        
+        // Clear interrupted status
+        Thread.interrupted();
+    }
+
+    @Test
     void shouldMeasureActualExecutionTime() throws Exception {
         executor = new VirtualThreadExecutor(
             ExecutorConfig.builder()

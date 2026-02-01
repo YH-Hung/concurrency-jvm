@@ -256,6 +256,58 @@ class VirtualPooledServiceTest {
     }
 
     @Test
+    void shouldFailFastInStructuredConcurrency() {
+        service = new VirtualPooledService<>(
+            () -> SimulatedCorbaClient.builder()
+                    .latency(50, 100)
+                    .failureRate(0.0)
+                    .verbose(false)
+                    .build(),
+            5
+        );
+
+        List<VirtualPooledService.OperationSubmission<SimulatedCorbaClient, String>> operations = new ArrayList<>();
+        operations.add(VirtualPooledService.OperationSubmission.of("ok-1", client -> client.execute("ok")));
+        operations.add(VirtualPooledService.OperationSubmission.of("fail-1", client -> {
+            throw new RuntimeException("forced failure");
+        }));
+        operations.add(VirtualPooledService.OperationSubmission.of("ok-2", client -> {
+            try {
+                Thread.sleep(1000); // Should be cancelled
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return client.execute("ok");
+        }));
+
+        assertThrows(Exception.class, () -> service.executeAllStructured(operations));
+    }
+
+    @Test
+    void shouldHandleFailuresInStructuredCollectAll() throws Exception {
+        service = new VirtualPooledService<>(
+            () -> SimulatedCorbaClient.builder()
+                    .latency(10, 20)
+                    .failureRate(0.0)
+                    .verbose(false)
+                    .build(),
+            5
+        );
+
+        List<VirtualPooledService.OperationSubmission<SimulatedCorbaClient, String>> operations = new ArrayList<>();
+        operations.add(VirtualPooledService.OperationSubmission.of("ok", client -> "success"));
+        operations.add(VirtualPooledService.OperationSubmission.of("fail", client -> {
+            throw new RuntimeException("forced failure");
+        }));
+
+        List<TaskResult<String>> results = service.executeAllStructuredCollectAll(operations);
+
+        assertEquals(2, results.size());
+        assertTrue(results.stream().anyMatch(r -> r.getTaskId().equals("ok") && r.isSuccess()));
+        assertTrue(results.stream().anyMatch(r -> r.isFailure()));
+    }
+
+    @Test
     void shouldCloseGracefully() {
         service = createService(5, 5);
 
