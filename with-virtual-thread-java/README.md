@@ -92,7 +92,7 @@ ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 ### Run the Demo
 
 ```bash
-mvn compile exec:java -Dexec.args="--enable-preview"
+mvn compile exec:java -Dexec.jvmArgs="--enable-preview"
 ```
 
 ### Run Tests

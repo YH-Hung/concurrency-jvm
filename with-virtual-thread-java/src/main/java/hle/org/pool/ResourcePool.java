@@ -2,8 +2,6 @@ package hle.org.pool;
 
 import org.apache.commons.pool2.impl.GenericObjectPool;
 import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.Objects;
@@ -50,8 +48,6 @@ import java.util.function.Supplier;
  */
 public class ResourcePool<R extends PooledResource<?>> implements AutoCloseable {
 
-    private static final Logger logger = LoggerFactory.getLogger(ResourcePool.class);
-    
     private final GenericObjectPool<R> internalPool;
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
@@ -114,22 +110,37 @@ public class ResourcePool<R extends PooledResource<?>> implements AutoCloseable 
 
         R resource = null;
         boolean valid = true;
+        ResourcePoolException failure = null;
+        T result = null;
         try {
             resource = internalPool.borrowObject();
-            return operation.apply(resource);
+            result = operation.apply(resource);
         } catch (Exception e) {
             // Note: We do not set valid=false here. We rely on resource.isValid() in returnResource
             // to determine if the resource should be invalidated. This allows reusing resources
             // even if the operation failed due to business logic errors.
             if (e instanceof ResourcePoolException) {
-                throw (ResourcePoolException) e;
+                failure = (ResourcePoolException) e;
+            } else {
+                failure = new ResourcePoolException("Failed to execute operation with pooled resource", e);
             }
-            throw new ResourcePoolException("Failed to execute operation with pooled resource", e);
         } finally {
             if (resource != null) {
-                returnResource(resource, valid);
+                try {
+                    returnResource(resource, valid);
+                } catch (ResourcePoolException returnEx) {
+                    if (failure != null) {
+                        failure.addSuppressed(returnEx);
+                    } else {
+                        failure = returnEx;
+                    }
+                }
             }
         }
+        if (failure != null) {
+            throw failure;
+        }
+        return result;
     }
 
     /**
@@ -151,21 +162,36 @@ public class ResourcePool<R extends PooledResource<?>> implements AutoCloseable 
 
         R resource = null;
         boolean valid = true;
+        ResourcePoolException failure = null;
+        T result = null;
         try {
             resource = internalPool.borrowObject(timeout.toMillis());
-            return operation.apply(resource);
+            result = operation.apply(resource);
         } catch (Exception e) {
             // Note: We do not set valid=false here. We rely on resource.isValid() in returnResource
             // to determine if the resource should be invalidated.
             if (e instanceof ResourcePoolException) {
-                throw (ResourcePoolException) e;
+                failure = (ResourcePoolException) e;
+            } else {
+                failure = new ResourcePoolException("Failed to execute operation with pooled resource", e);
             }
-            throw new ResourcePoolException("Failed to execute operation with pooled resource", e);
         } finally {
             if (resource != null) {
-                returnResource(resource, valid);
+                try {
+                    returnResource(resource, valid);
+                } catch (ResourcePoolException returnEx) {
+                    if (failure != null) {
+                        failure.addSuppressed(returnEx);
+                    } else {
+                        failure = returnEx;
+                    }
+                }
             }
         }
+        if (failure != null) {
+            throw failure;
+        }
+        return result;
     }
 
     private void returnResource(R resource, boolean valid) {
@@ -174,16 +200,10 @@ public class ResourcePool<R extends PooledResource<?>> implements AutoCloseable 
                 internalPool.returnObject(resource);
             } else {
                 // Invalidate the resource if it's no longer valid
-                try {
-                    internalPool.invalidateObject(resource);
-                } catch (Exception e) {
-                    // Best effort - resource will be destroyed
-                    logger.warn("Failed to invalidate resource: {}", e.getMessage());
-                }
+                internalPool.invalidateObject(resource);
             }
         } catch (Exception e) {
-            // Log but don't throw - we don't want to mask the original exception
-            logger.warn("Failed to return resource to pool: {}", e.getMessage());
+            throw new ResourcePoolException("Failed to return resource to pool", e);
         }
     }
 

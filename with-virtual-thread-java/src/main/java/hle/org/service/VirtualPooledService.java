@@ -12,7 +12,9 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.StructuredTaskScope;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
@@ -135,6 +137,12 @@ public class VirtualPooledService<R extends PooledResource<T>, T> implements Aut
     public <V> TaskResult<V> execute(String taskId, Function<R, V> operation) {
         try {
             return executeAsync(taskId, operation).get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return TaskResult.failure(taskId, e, Instant.now(), Instant.now());
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            return TaskResult.failure(taskId, cause, Instant.now(), Instant.now());
         } catch (Exception e) {
             return TaskResult.failure(taskId, e, Instant.now(), Instant.now());
         }
@@ -256,6 +264,9 @@ public class VirtualPooledService<R extends PooledResource<T>, T> implements Aut
                     // Create a failure result from the exception
                     Throwable exception = subtask.exception();
                     results.add(TaskResult.failure("unknown", exception, Instant.now(), Instant.now()));
+                } else if (subtask.state() == StructuredTaskScope.Subtask.State.CANCELLED) {
+                    results.add(TaskResult.failure("unknown",
+                        new CancellationException("Subtask cancelled"), Instant.now(), Instant.now()));
                 }
             }
             return results;
@@ -309,6 +320,11 @@ public class VirtualPooledService<R extends PooledResource<T>, T> implements Aut
                 Thread.currentThread().interrupt();
                 break;
             }
+        }
+        int active = resourcePool.getActiveCount();
+        if (active > 0) {
+            throw new IllegalStateException(
+                "Timed out waiting for " + active + " borrowed resources to be returned");
         }
         resourcePool.close();
     }

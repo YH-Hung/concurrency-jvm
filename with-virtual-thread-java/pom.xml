@@ -67,9 +67,9 @@
                 <version>3.1.0</version>
                 <configuration>
                     <mainClass>hle.org.demo.VirtualThreadDemo</mainClass>
-                    <arguments>
-                        <argument>--enable-preview</argument>
-                    </arguments>
+                    <jvmArgs>
+                        <jvmArg>--enable-preview</jvmArg>
+                    </jvmArgs>
                 </configuration>
             </plugin>
         </plugins>

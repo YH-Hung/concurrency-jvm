@@ -133,29 +133,41 @@ public class VirtualThreadExecutor implements AutoCloseable {
         CompletableFuture<TaskResult<T>> future = new CompletableFuture<>();
         final Thread[] executingThread = new Thread[1];
         final Instant[] startTimeHolder = new Instant[1];
+        final Instant[] queuedTimeHolder = new Instant[1];
 
         Runnable wrappedTask = () -> {
             Instant queuedTime = Instant.now();
+            queuedTimeHolder[0] = queuedTime;
+            executingThread[0] = Thread.currentThread();
+            if (future.isDone()) {
+                return;
+            }
             try {
                 // Acquire semaphore to respect concurrency limit
                 // Virtual thread will unmount from carrier thread while waiting
                 concurrencyLimiter.acquire();
+
+                if (future.isDone()) {
+                    concurrencyLimiter.release();
+                    return;
+                }
                 
                 // Capture actual execution start time (after semaphore wait)
                 Instant startTime = Instant.now();
                 startTimeHolder[0] = startTime;
-                executingThread[0] = Thread.currentThread();
                 activeCount.incrementAndGet();
                 
                 try {
                     T result = task.get();
                     Instant endTime = Instant.now();
-                    future.complete(TaskResult.success(taskId, result, startTime, endTime));
-                    completedCount.incrementAndGet();
+                    if (future.complete(TaskResult.success(taskId, result, startTime, endTime))) {
+                        completedCount.incrementAndGet();
+                    }
                 } catch (Exception e) {
                     Instant endTime = Instant.now();
-                    future.complete(TaskResult.failure(taskId, e, startTime, endTime));
-                    failedCount.incrementAndGet();
+                    if (future.complete(TaskResult.failure(taskId, e, startTime, endTime))) {
+                        failedCount.incrementAndGet();
+                    }
                 } finally {
                     activeCount.decrementAndGet();
                     concurrencyLimiter.release();
@@ -163,8 +175,9 @@ public class VirtualThreadExecutor implements AutoCloseable {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 Instant startTime = startTimeHolder[0] != null ? startTimeHolder[0] : queuedTime;
-                future.complete(TaskResult.failure(taskId, e, startTime, Instant.now()));
-                failedCount.incrementAndGet();
+                if (future.complete(TaskResult.failure(taskId, e, startTime, Instant.now()))) {
+                    failedCount.incrementAndGet();
+                }
             }
         };
 
@@ -179,7 +192,9 @@ public class VirtualThreadExecutor implements AutoCloseable {
                     if (!future.isDone()) {
                         TimeoutException timeoutEx = new TimeoutException(
                             "Task " + taskId + " exceeded timeout of " + timeout);
-                        Instant startTime = startTimeHolder[0] != null ? startTimeHolder[0] : Instant.now();
+                        Instant startTime = startTimeHolder[0] != null
+                            ? startTimeHolder[0]
+                            : (queuedTimeHolder[0] != null ? queuedTimeHolder[0] : Instant.now());
                         if (future.complete(TaskResult.failure(taskId, timeoutEx, startTime, Instant.now()))) {
                             timedOutCount.incrementAndGet();
                             failedCount.incrementAndGet();
