@@ -198,7 +198,7 @@ public class VirtualThreadDemo {
             System.out.println();
             System.out.println("Structured Concurrency Benefits:");
             System.out.println("  - Clear task ownership and lifecycle");
-            System.out.println("  - Automatic cancellation on failure (with ShutdownOnFailure)");
+            System.out.println("  - Automatic cancellation on failure (with Joiner.allSuccessfulOrThrow)");
             System.out.println("  - No orphaned virtual threads");
             System.out.println("  - Works naturally with try-with-resources");
 

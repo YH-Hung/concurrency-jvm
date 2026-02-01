@@ -66,10 +66,13 @@
                 <artifactId>exec-maven-plugin</artifactId>
                 <version>3.1.0</version>
                 <configuration>
-                    <mainClass>hle.org.demo.VirtualThreadDemo</mainClass>
-                    <jvmArgs>
-                        <jvmArg>--enable-preview</jvmArg>
-                    </jvmArgs>
+                    <executable>java</executable>
+                    <arguments>
+                        <argument>--enable-preview</argument>
+                        <argument>-classpath</argument>
+                        <classpath/>
+                        <argument>hle.org.demo.VirtualThreadDemo</argument>
+                    </arguments>
                 </configuration>
             </plugin>
         </plugins>

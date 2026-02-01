@@ -16,6 +16,8 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.StructuredTaskScope;
+import java.util.concurrent.StructuredTaskScope.Joiner;
+import java.util.concurrent.StructuredTaskScope.Subtask;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -192,10 +194,10 @@ public class VirtualPooledService<R extends PooledResource<T>, T> implements Aut
     /**
      * Executes multiple operations using Structured Concurrency (JDK 25 preview).
      * 
-     * <p>This method uses {@link StructuredTaskScope.ShutdownOnFailure} to:
+     * <p>This method uses {@link Joiner#allSuccessfulOrThrow()} to:
      * <ul>
      *   <li>Fork each operation as a subtask on its own virtual thread</li>
-     *   <li>Wait for all subtasks to complete</li>
+     *   <li>Wait for all subtasks to complete successfully</li>
      *   <li>Propagate the first exception if any subtask fails</li>
      *   <li>Cancel remaining subtasks on failure</li>
      * </ul>
@@ -211,22 +213,15 @@ public class VirtualPooledService<R extends PooledResource<T>, T> implements Aut
     public <V> List<TaskResult<V>> executeAllStructured(
             List<OperationSubmission<R, V>> operations) throws Exception {
         
-        try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
-            List<StructuredTaskScope.Subtask<TaskResult<V>>> subtasks = new ArrayList<>();
-            
+        try (var scope = StructuredTaskScope.open(Joiner.<TaskResult<V>>allSuccessfulOrThrow())) {
             for (OperationSubmission<R, V> op : operations) {
-                subtasks.add(scope.fork(() -> executeWithPool(op.getTaskId(), op.getOperation())));
+                scope.fork(() -> executeWithPool(op.getTaskId(), op.getOperation()));
             }
             
-            scope.join();           // Wait for all tasks
-            scope.throwIfFailed();  // Propagate first exception if any
-            
-            // All tasks succeeded, collect results
-            List<TaskResult<V>> results = new ArrayList<>();
-            for (var subtask : subtasks) {
-                results.add(subtask.get());
-            }
-            return results;
+            return scope.join().map(Subtask::get).toList();
+        } catch (Throwable t) {
+            if (t instanceof Exception e) throw e;
+            throw new RuntimeException(t);
         }
     }
 
@@ -246,8 +241,8 @@ public class VirtualPooledService<R extends PooledResource<T>, T> implements Aut
     public <V> List<TaskResult<V>> executeAllStructuredCollectAll(
             List<OperationSubmission<R, V>> operations) throws InterruptedException {
         
-        try (var scope = new StructuredTaskScope<TaskResult<V>>()) {
-            List<StructuredTaskScope.Subtask<TaskResult<V>>> subtasks = new ArrayList<>();
+        try (var scope = StructuredTaskScope.open(Joiner.<TaskResult<V>>awaitAll())) {
+            List<Subtask<TaskResult<V>>> subtasks = new ArrayList<>();
             
             for (OperationSubmission<R, V> op : operations) {
                 subtasks.add(scope.fork(() -> executeWithPool(op.getTaskId(), op.getOperation())));
@@ -258,15 +253,15 @@ public class VirtualPooledService<R extends PooledResource<T>, T> implements Aut
             // Collect all results, handling both success and failure
             List<TaskResult<V>> results = new ArrayList<>();
             for (var subtask : subtasks) {
-                if (subtask.state() == StructuredTaskScope.Subtask.State.SUCCESS) {
+                if (subtask.state() == Subtask.State.SUCCESS) {
                     results.add(subtask.get());
-                } else if (subtask.state() == StructuredTaskScope.Subtask.State.FAILED) {
+                } else if (subtask.state() == Subtask.State.FAILED) {
                     // Create a failure result from the exception
                     Throwable exception = subtask.exception();
                     results.add(TaskResult.failure("unknown", exception, Instant.now(), Instant.now()));
-                } else if (subtask.state() == StructuredTaskScope.Subtask.State.CANCELLED) {
+                } else if (subtask.state() == Subtask.State.UNAVAILABLE) {
                     results.add(TaskResult.failure("unknown",
-                        new CancellationException("Subtask cancelled"), Instant.now(), Instant.now()));
+                        new CancellationException("Subtask cancelled or unavailable"), Instant.now(), Instant.now()));
                 }
             }
             return results;
