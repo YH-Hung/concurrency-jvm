@@ -169,28 +169,86 @@ List<TaskResult<String>> results = executor.awaitAll(futures);
 
 ## Configuration
 
-### ExecutorConfig (Simplified)
+### ExecutorConfig (Simplified for Virtual Threads)
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `concurrency` | 10 | Max concurrent task executions (semaphore) |
-| `taskTimeout` | 5min | Max time per task |
-| `threadNamePrefix` | "virtual-executor" | Thread naming for debugging |
+| Option | Default | Description | Meaning & Effect |
+|--------|---------|-------------|-----------------|
+| `concurrency` | 10 | Max concurrent task executions (semaphore) | Semaphore permit count controlling the maximum simultaneous downstream calls. Unlike platform threads, virtual threads are cheap to create — this limit exists to protect the **downstream service** from being overwhelmed, not to manage OS thread resources. Set to match the downstream server's connection or concurrency limit. |
+| `taskTimeout` | 5min | Max time per task | Hard per-task deadline. The virtual thread is interrupted when exceeded. Prevents tasks from holding semaphore permits indefinitely when a downstream service hangs or is unresponsive. |
+| `threadNamePrefix` | "virtual-executor" | Thread naming for debugging | Prefix for virtual thread names visible in thread dumps and logs. Use a descriptive name like `"corba-vt"` to distinguish tasks from different executors during debugging. |
 
 **Note:** Unlike the pre-virtual-thread version, there's no need to configure:
-- `corePoolSize` / `maxPoolSize` - virtual threads are cheap
-- `queueCapacity` - task submission doesn't block
+- `corePoolSize` / `maxPoolSize` — virtual threads are created on demand and are extremely lightweight (~1 KB stack vs ~1 MB for platform threads)
+- `queueCapacity` — task submission creates a virtual thread immediately without queuing
+- `rejectionPolicy` — there is no queue to overflow
+- `daemon` — not applicable to virtual threads
 
-### ResourcePoolConfig (Unchanged)
+### ResourcePoolConfig
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `minPoolSize` | 2 | Minimum idle resources |
-| `maxPoolSize` | 10 | Maximum resources |
-| `maxWaitTime` | 30s | Time to wait for a resource |
-| `testOnBorrow` | true | Validate before use |
+| Option | Default | Description | Meaning & Effect |
+|--------|---------|-------------|-----------------|
+| `minPoolSize` | 2 | Minimum idle resources | Number of resources kept alive at all times. Higher values reduce cold-start latency at the cost of holding idle resources. Set to at least 1 in production. |
+| `maxPoolSize` | 10 | Maximum resources | Hard cap on total live resources (e.g. CORBA connections). Acts as an implicit concurrency ceiling — no more than this many tasks can hold a resource simultaneously. Must not exceed the downstream server's connection limit. |
+| `maxWaitTime` | 30s | Time to wait for a resource | How long a virtual thread blocks when the pool is exhausted. If exceeded, a `ResourcePoolException` is thrown. With virtual threads, blocking here is cheap (carrier thread is freed), but the semaphore permit is still held. |
+| `maxIdleTime` | 5min | Idle time before eviction | A resource idle longer than this is evicted and closed. Prevents stale or leaked connections. Lower = more aggressive cleanup; higher = connections stay warm longer. |
+| `testOnBorrow` | true | Validate before use | Calls `isValid()` before handing a resource to a caller. Catches broken connections before they fail an operation. Recommended `true` on unreliable networks. |
+| `testOnReturn` | false | Validate before returning to the pool | Calls `isValid()` when a resource is returned. Usually redundant when `testOnBorrow` is `true`. |
+| `testWhileIdle` | true | Validate idle resources periodically | Background thread validates idle resources on each eviction sweep. Keeps the pool healthy during quiet periods without adding hot-path latency. |
+| `timeBetweenEvictionRuns` | 30s | How often to run idle eviction | Interval between background eviction/validation sweeps. Works in tandem with `testWhileIdle` and `maxIdleTime`. |
+| `blockWhenExhausted` | true | Block vs fail when exhausted | When `true`, the virtual thread blocks (cheaply — carrier is freed) until a resource is available. When `false`, throws immediately. Use `true` for batch workloads; `false` for fail-fast APIs. |
 
-Resource pooling remains valuable for expensive resources like CORBA connections.
+Resource pooling remains valuable for expensive resources like CORBA connections even with virtual threads — the cost is in the resource itself, not the thread.
+
+### Configuration Combination Examples
+
+**Standard downstream rate-limited service — pool size equals concurrency equals downstream limit:**
+```java
+ResourcePoolConfig.builder()
+    .maxPoolSize(20)          // 20 CORBA connections
+    .minPoolSize(5)
+    .testOnBorrow(true)
+    .testWhileIdle(true)
+    .build()
+
+ExecutorConfig.builder()
+    .concurrency(20)          // matches pool size — semaphore permit = guaranteed resource
+    .taskTimeout(Duration.ofMinutes(2))
+    .threadNamePrefix("corba-vt")
+    .build()
+```
+
+> **Tip:** Setting `concurrency` equal to `ResourcePoolConfig.maxPoolSize` ensures a task that acquires a semaphore permit is guaranteed a pool resource immediately, eliminating pool-wait latency.
+
+**Protect a fragile downstream service — low concurrency lets virtual threads queue cheaply:**
+```java
+ResourcePoolConfig.builder()
+    .maxPoolSize(5)
+    .testOnBorrow(true)
+    .maxWaitTime(Duration.ofSeconds(10))
+    .build()
+
+ExecutorConfig.builder()
+    .concurrency(5)           // conservative downstream limit
+    .taskTimeout(Duration.ofSeconds(30))
+    .threadNamePrefix("fragile-svc-vt")
+    .build()
+```
+
+**Maximum throughput — when the downstream can handle high concurrency:**
+```java
+ResourcePoolConfig.builder()
+    .maxPoolSize(100)
+    .minPoolSize(20)          // keep connections warm
+    .testOnBorrow(true)
+    .testWhileIdle(true)
+    .build()
+
+ExecutorConfig.builder()
+    .concurrency(100)
+    .taskTimeout(Duration.ofMinutes(5))
+    .threadNamePrefix("high-throughput-vt")
+    .build()
+```
 
 ## Spring Integration
 
