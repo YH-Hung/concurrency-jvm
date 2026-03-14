@@ -396,6 +396,106 @@ src/main/java/hle/org/
     └── ConcurrentCorbaDemo.java     # Demonstration
 ```
 
+## Java 6 Incompatibilities
+
+This project is configured for Java 17 and uses numerous features unavailable in Java 6. The **minimum required Java version is Java 8** (driven primarily by `java.time`, lambdas, streams, `Optional`, and `CompletableFuture`).
+
+### Java 8 — Lambda Expressions
+
+| File | Lines | Usage |
+|------|-------|-------|
+| `executor/BoundedConcurrencyExecutor.java` | 88–98, 123–127, 141–159 | Lambdas in `ThreadFactory` and task handlers |
+| `service/PooledExecutorService.java` | 151–156 | Lambda in stream `map` |
+| `demo/ConcurrentCorbaDemo.java` | 100–106, 146–147 | Lambdas in stream operations |
+| `BoundedConcurrencyExecutorTest.java` | 80–90, 124–126, 146–153, 185–192, 228–230, 275–276, 287–288, 309–310, 341–351, 402–403, 422–430 | Lambdas throughout test submissions |
+| `ResourcePoolTest.java` | 91–101, 146–156 | Lambdas in executor submissions |
+| `PooledExecutorServiceTest.java` | 76–82, 120–130, 177–183, 216–220 | Lambdas in test operations |
+| `SimulatedCorbaClientTest.java` | Multiple | Lambdas in test code |
+
+### Java 8 — Stream API (`java.util.stream`)
+
+| File | Lines | Usage |
+|------|-------|-------|
+| `executor/BoundedConcurrencyExecutor.java` | 12, 272–274, 285–296 | Stream import and `.stream()` / `.toArray()` |
+| `service/PooledExecutorService.java` | 151–158, 167–169 | `.stream()`, `.map()`, `.collect()` |
+| `demo/ConcurrentCorbaDemo.java` | 101–106, 173–174, 186–188, 197–200, 215–217 | Multiple stream pipelines |
+
+### Java 8 — `java.time` Package
+
+| File | Lines | Classes Used |
+|------|-------|--------------|
+| `executor/ExecutorConfig.java` | 3, 21, 102 | `Duration` |
+| `executor/BoundedConcurrencyExecutor.java` | 3–4, 228–229 | `Duration`, `Instant` |
+| `executor/TaskResult.java` | 3–4, 79–80 | `Duration`, `Instant` |
+| `pool/ResourcePool.java` | 8 | `Duration` |
+| `pool/ResourcePoolConfig.java` | 3, 86–92 | `Duration` |
+| `service/PooledExecutorService.java` | 10 | `Duration` |
+| `client/SimulatedCorbaClient.java` | 3–4 | `LocalTime`, `DateTimeFormatter` |
+| `demo/ConcurrentCorbaDemo.java` | 12–13 | `Duration`, `Instant` |
+
+### Java 8 — `Optional`
+
+| File | Lines | Usage |
+|------|-------|-------|
+| `executor/TaskResult.java` | 5, 52–58 | `java.util.Optional` field and return type |
+| `BoundedConcurrencyExecutorTest.java` | 43, 57–58, 291 | `.isPresent()`, `.orElse()` |
+| `PooledExecutorServiceTest.java` | 50–51 | `.isPresent()`, `.get()` |
+
+### Java 8 — `CompletableFuture`
+
+| File | Lines | Usage |
+|------|-------|-------|
+| `executor/BoundedConcurrencyExecutor.java` | 7, 180–183, 187, 305 | Core async task return type |
+| `service/PooledExecutorService.java` | 15 | Async result handling |
+| `demo/ConcurrentCorbaDemo.java` | 17, 112, 141 | Async task composition |
+
+### Java 8 — Functional Interfaces (`java.util.function`)
+
+| File | Lines | Interfaces Used |
+|------|-------|-----------------|
+| `executor/BoundedConcurrencyExecutor.java` | 11 | `Supplier` |
+| `pool/ResourcePool.java` | 11–12 | `Function`, `Supplier` |
+| `service/PooledExecutorService.java` | 17–18 | `Function`, `Supplier` |
+
+### Java 8 — Method References
+
+| File | Lines | Usage |
+|------|-------|-------|
+| `BoundedConcurrencyExecutorTest.java` | 476–478 | Method reference in `Collectors` |
+| `demo/ConcurrentCorbaDemo.java` | 215–221 | `TaskResult::isSuccess` |
+
+### Java 7 — `AutoCloseable` Interface
+
+| File | Line | Usage |
+|------|------|-------|
+| `executor/BoundedConcurrencyExecutor.java` | 60 | `implements AutoCloseable` |
+| `pool/ResourcePool.java` | 44 | `implements AutoCloseable` |
+| `service/PooledExecutorService.java` | 60 | `implements AutoCloseable` |
+| `pool/PooledResource.java` | 17 | `extends AutoCloseable` |
+
+### Java 7 — `Objects.requireNonNull()`
+
+| File | Lines | Usage |
+|------|-------|-------|
+| `executor/BoundedConcurrencyExecutor.java` | 6, 176–177 | Null checks in constructor |
+| `pool/ResourcePool.java` | 9, 102, 138–139 | Null checks in constructor and methods |
+| `service/PooledExecutorService.java` | 14, 122–123 | Null checks in constructor |
+
+### Java 7 — Diamond Operator (`<>`)
+
+| File | Line | Usage |
+|------|------|-------|
+| `executor/BoundedConcurrencyExecutor.java` | 85 | `new LinkedBlockingQueue<>()` |
+| Multiple files | Various | Generic type inference throughout |
+
+### Java 7 — `ThreadLocalRandom`
+
+| File | Lines | Usage |
+|------|-------|-------|
+| `client/SimulatedCorbaClient.java` | 6, 88, 98 | `java.util.concurrent.ThreadLocalRandom` for simulated latency |
+
+---
+
 ## License
 
 MIT
