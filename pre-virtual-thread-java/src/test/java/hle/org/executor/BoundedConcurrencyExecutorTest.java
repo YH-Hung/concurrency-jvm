@@ -9,6 +9,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -319,10 +320,11 @@ class BoundedConcurrencyExecutorTest {
     @Timeout(10)
     void shouldSupportSeparatePoolSizeConfiguration() throws Exception {
         // Configure with separate corePoolSize, maxPoolSize, and concurrency
-        int corePoolSize = 2;
+        // corePoolSize must be >= concurrency to avoid throughput trap
+        int corePoolSize = 5;
         int maxPoolSize = 10;
         int concurrency = 5;  // Semaphore permits - actual concurrency limit
-        
+
         executor = new BoundedConcurrencyExecutor(
             ExecutorConfig.builder()
                 .corePoolSize(corePoolSize)
@@ -389,11 +391,13 @@ class BoundedConcurrencyExecutorTest {
     @Timeout(10)
     void shouldWorkWithZeroCorePoolSize() throws Exception {
         // Test that corePoolSize=0 still processes tasks correctly
+        // Use small queueCapacity (<= concurrency) to allow thread pool scaling
         executor = new BoundedConcurrencyExecutor(
             ExecutorConfig.builder()
                 .corePoolSize(0)
                 .maxPoolSize(5)
                 .concurrency(5)
+                .queueCapacity(5)
                 .build()
         );
 
@@ -562,6 +566,98 @@ class BoundedConcurrencyExecutorTest {
 
         assertNotNull(results);
         assertTrue(results.isEmpty());
+    }
+
+    @Test
+    @Timeout(10)
+    void shouldNotDoubleCountStatsOnTimeout() throws Exception {
+        executor = new BoundedConcurrencyExecutor(
+            ExecutorConfig.builder()
+                .concurrency(1)
+                .taskTimeout(Duration.ofMillis(100))
+                .build()
+        );
+
+        CountDownLatch taskStarted = new CountDownLatch(1);
+        CompletableFuture<TaskResult<String>> future = executor.submit("timeout-stats", () -> {
+            taskStarted.countDown();
+            try {
+                Thread.sleep(5000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return "late";
+        });
+
+        taskStarted.await(5, TimeUnit.SECONDS);
+        TaskResult<String> result = future.get(5, TimeUnit.SECONDS);
+
+        assertTrue(result.isFailure());
+        // Wait for the interrupted task to finish and release its semaphore
+        Thread.sleep(200);
+
+        assertEquals(0, executor.getCompletedCount(), "Timed-out task should not increment completedCount");
+        assertEquals(1, executor.getFailedCount(), "failedCount should be exactly 1, not double-counted");
+        assertEquals(1, executor.getTimedOutCount());
+    }
+
+    @Test
+    @Timeout(10)
+    void shouldInterruptRunningWorkOnAwaitAllTimeout() throws Exception {
+        executor = new BoundedConcurrencyExecutor(
+            ExecutorConfig.builder()
+                .concurrency(5)
+                .taskTimeout(Duration.ofMinutes(5))
+                .build()
+        );
+
+        AtomicBoolean wasInterrupted = new AtomicBoolean(false);
+        CountDownLatch taskStarted = new CountDownLatch(1);
+
+        List<CompletableFuture<TaskResult<String>>> futures = new ArrayList<>();
+        futures.add(executor.submit("interruptible", () -> {
+            taskStarted.countDown();
+            try {
+                Thread.sleep(30000);
+            } catch (InterruptedException e) {
+                wasInterrupted.set(true);
+                Thread.currentThread().interrupt();
+            }
+            return "done";
+        }));
+
+        taskStarted.await(5, TimeUnit.SECONDS);
+
+        assertThrows(TimeoutException.class, () ->
+            executor.awaitAll(futures, Duration.ofMillis(200))
+        );
+
+        // Give the interrupt a moment to propagate
+        Thread.sleep(200);
+        assertTrue(wasInterrupted.get(), "Running task should have been interrupted on awaitAll timeout");
+    }
+
+    @Test
+    void shouldRejectCorePoolSizeLessThanConcurrencyWithLargeQueue() {
+        assertThrows(IllegalArgumentException.class, () ->
+            ExecutorConfig.builder()
+                .corePoolSize(2)
+                .concurrency(10)
+                .queueCapacity(1000)
+                .build()
+        );
+    }
+
+    @Test
+    void shouldAllowCorePoolSizeLessThanConcurrencyWithSmallQueue() {
+        // This should NOT throw — small queue allows ThreadPoolExecutor to scale threads
+        ExecutorConfig config = ExecutorConfig.builder()
+            .corePoolSize(2)
+            .maxPoolSize(10)
+            .concurrency(10)
+            .queueCapacity(10)
+            .build();
+        assertEquals(2, config.getCorePoolSize());
     }
 
     @Test

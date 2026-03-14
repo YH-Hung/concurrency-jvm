@@ -236,7 +236,20 @@ public class ExecutorConfig {
                 throw new IllegalArgumentException(
                     "maxPoolSize (" + effectiveMaxPoolSize + ") must be >= corePoolSize (" + effectiveCorePoolSize + ")");
             }
-            
+
+            // Validate that corePoolSize is sufficient for intended concurrency.
+            // ThreadPoolExecutor prefers queueing over creating threads beyond corePoolSize,
+            // so if corePoolSize < concurrency with a large queue, the pool may never scale
+            // up to the intended concurrency level.
+            if (effectiveCorePoolSize < concurrency && queueCapacity > concurrency) {
+                throw new IllegalArgumentException(
+                    "corePoolSize (" + effectiveCorePoolSize + ") < concurrency (" + concurrency
+                    + ") with queueCapacity (" + queueCapacity + ") > concurrency. "
+                    + "ThreadPoolExecutor will not create threads beyond corePoolSize until the queue is full, "
+                    + "so the intended concurrency level may never be reached. "
+                    + "Set corePoolSize >= concurrency, or reduce queueCapacity to <= concurrency.");
+            }
+
             return new ExecutorConfig(this);
         }
     }

@@ -9,6 +9,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
@@ -70,6 +71,9 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
     // Counter for auto-generated task IDs (separate from submittedCount to avoid race condition)
     private final AtomicLong autoTaskIdCounter = new AtomicLong(0);
     
+    // Maps futures to their executing threads for cancellation support
+    private final ConcurrentHashMap<CompletableFuture<?>, AtomicReference<Thread>> runningTasks = new ConcurrentHashMap<>();
+
     // Statistics
     private final AtomicLong submittedCount = new AtomicLong(0);
     private final AtomicLong completedCount = new AtomicLong(0);
@@ -140,11 +144,14 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
             case BLOCK:
                 // Block until space is available - this is the default for preventing overload
                 return (r, executor) -> {
-                    if (executor.isShutdown()) {
-                        throw new RejectedExecutionException("Executor is shutdown");
-                    }
                     try {
-                        executor.getQueue().put(r);
+                        // Use offer with timeout in a loop to re-check shutdown (Fix 3)
+                        while (!executor.isShutdown()) {
+                            if (executor.getQueue().offer(r, 100, TimeUnit.MILLISECONDS)) {
+                                return;
+                            }
+                        }
+                        throw new RejectedExecutionException("Executor is shutdown");
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                         throw new RejectedExecutionException("Interrupted while waiting for queue space", e);
@@ -186,45 +193,60 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
 
         submittedCount.incrementAndGet();
         CompletableFuture<TaskResult<T>> future = new CompletableFuture<>();
-        final Thread[] executingThread = new Thread[1];
-        final Instant[] startTimeHolder = new Instant[1];
+        AtomicReference<Thread> executingThread = new AtomicReference<>();
+        AtomicReference<Instant> startTimeHolder = new AtomicReference<>();
+
+        // Register for cancellation support (Fix 2)
+        runningTasks.put(future, executingThread);
 
         Runnable wrappedTask = () -> {
             Instant queuedTime = Instant.now();
             try {
                 // Acquire semaphore to respect concurrency limit
                 concurrencyLimiter.acquire();
-                
+
+                // If future is already done (e.g. timed out), skip execution (Fix 1)
+                if (future.isDone()) {
+                    concurrencyLimiter.release();
+                    return;
+                }
+
                 // Capture actual execution start time (after semaphore wait)
                 Instant startTime = Instant.now();
-                startTimeHolder[0] = startTime;
-                executingThread[0] = Thread.currentThread();
+                startTimeHolder.set(startTime);
+                executingThread.set(Thread.currentThread());
                 activeCount.incrementAndGet();
-                
+
                 try {
                     T result = task.get();
                     Instant endTime = Instant.now();
-                    future.complete(TaskResult.success(taskId, result, startTime, endTime));
-                    completedCount.incrementAndGet();
+                    // Only increment stats if we were the one to finalize (Fix 1)
+                    if (future.complete(TaskResult.success(taskId, result, startTime, endTime))) {
+                        completedCount.incrementAndGet();
+                    }
                 } catch (Exception e) {
                     Instant endTime = Instant.now();
-                    future.complete(TaskResult.failure(taskId, e, startTime, endTime));
-                    failedCount.incrementAndGet();
+                    if (future.complete(TaskResult.failure(taskId, e, startTime, endTime))) {
+                        failedCount.incrementAndGet();
+                    }
                 } finally {
                     activeCount.decrementAndGet();
                     concurrencyLimiter.release();
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                Instant startTime = startTimeHolder[0] != null ? startTimeHolder[0] : queuedTime;
-                future.complete(TaskResult.failure(taskId, e, startTime, Instant.now()));
-                failedCount.incrementAndGet();
+                Instant startTime = startTimeHolder.get() != null ? startTimeHolder.get() : queuedTime;
+                if (future.complete(TaskResult.failure(taskId, e, startTime, Instant.now()))) {
+                    failedCount.incrementAndGet();
+                }
+            } finally {
+                runningTasks.remove(future);
             }
         };
 
         try {
             workerPool.execute(wrappedTask);
-            
+
             // Schedule timeout enforcement if configured
             Duration timeout = config.getTaskTimeout();
             if (timeout != null && !timeout.isZero() && !timeout.isNegative()) {
@@ -232,12 +254,12 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
                     if (!future.isDone()) {
                         TimeoutException timeoutEx = new TimeoutException(
                             "Task " + taskId + " exceeded timeout of " + timeout);
-                        Instant startTime = startTimeHolder[0] != null ? startTimeHolder[0] : Instant.now();
+                        Instant startTime = startTimeHolder.get() != null ? startTimeHolder.get() : Instant.now();
                         if (future.complete(TaskResult.failure(taskId, timeoutEx, startTime, Instant.now()))) {
                             timedOutCount.incrementAndGet();
                             failedCount.incrementAndGet();
                             // Interrupt the executing thread if it's still running
-                            Thread thread = executingThread[0];
+                            Thread thread = executingThread.get();
                             if (thread != null) {
                                 thread.interrupt();
                             }
@@ -246,8 +268,10 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
                 }, timeout.toMillis(), TimeUnit.MILLISECONDS);
             }
         } catch (RejectedExecutionException e) {
-            future.complete(TaskResult.failure(taskId, e, Instant.now(), Instant.now()));
-            failedCount.incrementAndGet();
+            runningTasks.remove(future);
+            if (future.complete(TaskResult.failure(taskId, e, Instant.now(), Instant.now()))) {
+                failedCount.incrementAndGet();
+            }
         }
 
         return future;
@@ -313,6 +337,14 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
             for (CompletableFuture<TaskResult<T>> f : futures) {
                 if (!f.isDone()) {
                     f.cancel(true);
+                    // Also interrupt the actual executing thread (Fix 2)
+                    AtomicReference<Thread> threadRef = runningTasks.remove(f);
+                    if (threadRef != null) {
+                        Thread thread = threadRef.get();
+                        if (thread != null) {
+                            thread.interrupt();
+                        }
+                    }
                 }
             }
             throw new TimeoutException(e.getMessage());
@@ -399,6 +431,9 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
     public void shutdown() {
         if (shutdown.compareAndSet(false, true)) {
             workerPool.shutdown();
+            // Note: timeoutScheduler is NOT shut down here because it may still need to
+            // enforce timeouts on in-flight tasks. It is shut down in awaitTermination()
+            // after workers have completed, or in shutdownNow()/close().
         }
     }
 
@@ -408,6 +443,7 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
      */
     public List<Runnable> shutdownNow() {
         shutdown.set(true);
+        timeoutScheduler.shutdownNow();
         return workerPool.shutdownNow();
     }
 
@@ -416,7 +452,14 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
      * or the timeout occurs.
      */
     public boolean awaitTermination(Duration timeout) throws InterruptedException {
-        return workerPool.awaitTermination(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        long deadlineNanos = System.nanoTime() + timeout.toNanos();
+        boolean workerTerminated = workerPool.awaitTermination(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        // Once workers are done, timeout scheduler is no longer needed (Fix 5)
+        timeoutScheduler.shutdownNow();
+        long remainingNanos = deadlineNanos - System.nanoTime();
+        boolean schedulerTerminated = timeoutScheduler.awaitTermination(
+            Math.max(0, remainingNanos), TimeUnit.NANOSECONDS);
+        return workerTerminated && schedulerTerminated;
     }
 
     /**
@@ -436,16 +479,12 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
     @Override
     public void close() {
         shutdown();
-        timeoutScheduler.shutdown();
         try {
             if (!awaitTermination(Duration.ofSeconds(30))) {
                 shutdownNow();
             }
-            // Also wait for timeout scheduler to terminate
-            timeoutScheduler.awaitTermination(5, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             shutdownNow();
-            timeoutScheduler.shutdownNow();
             Thread.currentThread().interrupt();
         }
     }
