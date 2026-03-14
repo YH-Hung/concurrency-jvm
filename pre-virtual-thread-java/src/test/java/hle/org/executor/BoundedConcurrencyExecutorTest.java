@@ -518,7 +518,83 @@ class BoundedConcurrencyExecutorTest {
         // not ~250ms (queue wait + execution time)
         // Allow some tolerance for test flakiness
         long duration = secondResult.getDuration().toMillis();
-        assertTrue(duration < 200, 
+        assertTrue(duration < 200,
             "Duration should reflect execution time (~100ms), not queue wait time. Actual: " + duration + "ms");
+    }
+
+    @Test
+    @Timeout(10)
+    void shouldCancelIncompleteFuturesOnTimeout() {
+        executor = new BoundedConcurrencyExecutor(
+            ExecutorConfig.builder()
+                .concurrency(2)
+                .queueCapacity(100)
+                .build()
+        );
+
+        List<CompletableFuture<TaskResult<String>>> futures = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            futures.add(executor.submit("slow-" + i, () -> {
+                try {
+                    Thread.sleep(5000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return "done";
+            }));
+        }
+
+        assertThrows(TimeoutException.class, () ->
+            executor.awaitAll(futures, Duration.ofMillis(200))
+        );
+
+        // After timeout, all futures should be done (completed or cancelled)
+        for (CompletableFuture<TaskResult<String>> f : futures) {
+            assertTrue(f.isDone(), "Future should be done after timeout");
+        }
+    }
+
+    @Test
+    void shouldHandleEmptyFuturesList() {
+        executor = new BoundedConcurrencyExecutor();
+
+        List<TaskResult<String>> results = executor.awaitAll(new ArrayList<>());
+
+        assertNotNull(results);
+        assertTrue(results.isEmpty());
+    }
+
+    @Test
+    @Timeout(10)
+    void shouldPreserveResultOrderInAwaitAll() throws Exception {
+        executor = new BoundedConcurrencyExecutor(
+            ExecutorConfig.builder()
+                .concurrency(10)
+                .build()
+        );
+
+        // Submit tasks where earlier tasks take longer, so they complete in reverse order
+        int taskCount = 20;
+        List<CompletableFuture<TaskResult<Integer>>> futures = new ArrayList<>();
+        for (int i = 0; i < taskCount; i++) {
+            final int taskNum = i;
+            futures.add(executor.submit("order-" + i, () -> {
+                try {
+                    // Task 0 sleeps longest, task 19 sleeps least
+                    Thread.sleep((taskCount - taskNum) * 10);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return taskNum;
+            }));
+        }
+
+        List<TaskResult<Integer>> results = executor.awaitAll(futures);
+
+        assertEquals(taskCount, results.size());
+        for (int i = 0; i < taskCount; i++) {
+            assertEquals(i, results.get(i).getValue().orElse(-1),
+                "Result at index " + i + " should match task " + i);
+        }
     }
 }

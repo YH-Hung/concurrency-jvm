@@ -2,6 +2,7 @@ package hle.org.executor;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.*;
@@ -245,35 +246,52 @@ public class VirtualThreadExecutor implements AutoCloseable {
      * @return list of TaskResults
      */
     public <T> List<TaskResult<T>> awaitAll(List<CompletableFuture<TaskResult<T>>> futures) {
-        return futures.stream()
-            .map(f -> {
-                try {
-                    return f.get();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return TaskResult.<T>failure("unknown", e, Instant.now(), Instant.now());
-                } catch (ExecutionException e) {
-                    return TaskResult.<T>failure("unknown", e.getCause(), Instant.now(), Instant.now());
-                }
-            })
-            .collect(Collectors.toList());
+        List<TaskResult<T>> results = new ArrayList<>(futures.size());
+        for (CompletableFuture<TaskResult<T>> f : futures) {
+            try {
+                results.add(f.join());
+            } catch (CompletionException e) {
+                results.add(TaskResult.<T>failure("unknown", e.getCause(), Instant.now(), Instant.now()));
+            } catch (CancellationException e) {
+                results.add(TaskResult.<T>failure("unknown", e, Instant.now(), Instant.now()));
+            }
+        }
+        return results;
     }
 
     /**
      * Waits for all futures to complete with a timeout.
      */
-    public <T> List<TaskResult<T>> awaitAll(List<CompletableFuture<TaskResult<T>>> futures, 
+    public <T> List<TaskResult<T>> awaitAll(List<CompletableFuture<TaskResult<T>>> futures,
                                              Duration timeout) throws TimeoutException {
         try {
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
                 .get(timeout.toMillis(), TimeUnit.MILLISECONDS);
-            return awaitAll(futures);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException("Interrupted while waiting for tasks", e);
         } catch (ExecutionException e) {
-            throw new RuntimeException("Unexpected execution exception", e);
+            // submit() wraps all outcomes in TaskResult, so this is defensive only
+        } catch (java.util.concurrent.TimeoutException e) {
+            for (CompletableFuture<TaskResult<T>> f : futures) {
+                if (!f.isDone()) {
+                    f.cancel(true);
+                }
+            }
+            throw new TimeoutException(e.getMessage());
         }
+        // All futures are done — collect results directly without a second iteration
+        List<TaskResult<T>> results = new ArrayList<>(futures.size());
+        for (CompletableFuture<TaskResult<T>> f : futures) {
+            try {
+                results.add(f.join());
+            } catch (CompletionException e) {
+                results.add(TaskResult.<T>failure("unknown", e.getCause(), Instant.now(), Instant.now()));
+            } catch (CancellationException e) {
+                results.add(TaskResult.<T>failure("unknown", e, Instant.now(), Instant.now()));
+            }
+        }
+        return results;
     }
 
     /**
