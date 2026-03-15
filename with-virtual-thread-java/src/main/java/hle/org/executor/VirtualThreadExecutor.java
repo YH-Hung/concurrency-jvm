@@ -9,6 +9,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
@@ -59,6 +60,8 @@ import java.util.stream.Collectors;
  */
 public class VirtualThreadExecutor implements AutoCloseable {
 
+    private static final System.Logger logger = System.getLogger(VirtualThreadExecutor.class.getName());
+
     private final ExecutorService virtualThreadExecutor;
     private final ScheduledExecutorService timeoutScheduler;
     private final Semaphore concurrencyLimiter;
@@ -74,6 +77,9 @@ public class VirtualThreadExecutor implements AutoCloseable {
     private final AtomicLong failedCount = new AtomicLong(0);
     private final AtomicLong timedOutCount = new AtomicLong(0);
     private final AtomicInteger activeCount = new AtomicInteger(0);
+
+    // Maps futures to their executing threads for cancellation support
+    private final ConcurrentHashMap<CompletableFuture<?>, AtomicReference<Thread>> runningTasks = new ConcurrentHashMap<>();
 
     /**
      * Creates a new executor with the given configuration.
@@ -91,13 +97,17 @@ public class VirtualThreadExecutor implements AutoCloseable {
         
         // Create a single-threaded scheduler for task timeout enforcement
         // Use a platform thread for the scheduler since it's lightweight
-        this.timeoutScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1, r -> {
             Thread t = Thread.ofPlatform()
                 .name(config.getThreadNamePrefix() + "-timeout-scheduler")
                 .daemon(true)
                 .unstarted(r);
             return t;
         });
+        // Don't execute pending timeout tasks after shutdown, and remove cancelled tasks promptly
+        scheduler.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+        scheduler.setRemoveOnCancelPolicy(true);
+        this.timeoutScheduler = scheduler;
     }
 
     /**
@@ -124,6 +134,8 @@ public class VirtualThreadExecutor implements AutoCloseable {
         Objects.requireNonNull(task, "task cannot be null");
         
         if (shutdown.get()) {
+            submittedCount.incrementAndGet();
+            failedCount.incrementAndGet();
             return CompletableFuture.completedFuture(
                 TaskResult.failure(taskId, new RejectedExecutionException("Executor is shutdown"),
                     Instant.now(), Instant.now())
@@ -132,18 +144,21 @@ public class VirtualThreadExecutor implements AutoCloseable {
 
         submittedCount.incrementAndGet();
         CompletableFuture<TaskResult<T>> future = new CompletableFuture<>();
-        final Thread[] executingThread = new Thread[1];
-        final Instant[] startTimeHolder = new Instant[1];
-        final Instant[] queuedTimeHolder = new Instant[1];
+        AtomicReference<Thread> executingThread = new AtomicReference<>();
+        AtomicReference<Instant> startTimeHolder = new AtomicReference<>();
+        AtomicReference<Instant> queuedTimeHolder = new AtomicReference<>();
+
+        // Register for cancellation support
+        runningTasks.put(future, executingThread);
 
         Runnable wrappedTask = () -> {
             Instant queuedTime = Instant.now();
-            queuedTimeHolder[0] = queuedTime;
-            executingThread[0] = Thread.currentThread();
-            if (future.isDone()) {
-                return;
-            }
+            queuedTimeHolder.set(queuedTime);
+            executingThread.set(Thread.currentThread());
             try {
+                if (future.isDone()) {
+                    return;
+                }
                 // Acquire semaphore to respect concurrency limit
                 // Virtual thread will unmount from carrier thread while waiting
                 concurrencyLimiter.acquire();
@@ -152,12 +167,12 @@ public class VirtualThreadExecutor implements AutoCloseable {
                     concurrencyLimiter.release();
                     return;
                 }
-                
+
                 // Capture actual execution start time (after semaphore wait)
                 Instant startTime = Instant.now();
-                startTimeHolder[0] = startTime;
+                startTimeHolder.set(startTime);
                 activeCount.incrementAndGet();
-                
+
                 try {
                     T result = task.get();
                     Instant endTime = Instant.now();
@@ -169,48 +184,69 @@ public class VirtualThreadExecutor implements AutoCloseable {
                     if (future.complete(TaskResult.failure(taskId, e, startTime, endTime))) {
                         failedCount.incrementAndGet();
                     }
+                } catch (Error e) {
+                    // Complete the future so callers aren't stuck, but rethrow the error
+                    if (future.complete(TaskResult.failure(taskId, e, startTime, Instant.now()))) {
+                        failedCount.incrementAndGet();
+                    }
+                    throw e;
                 } finally {
                     activeCount.decrementAndGet();
                     concurrencyLimiter.release();
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                Instant startTime = startTimeHolder[0] != null ? startTimeHolder[0] : queuedTime;
+                Instant startTime = startTimeHolder.get() != null ? startTimeHolder.get() : queuedTime;
                 if (future.complete(TaskResult.failure(taskId, e, startTime, Instant.now()))) {
                     failedCount.incrementAndGet();
                 }
+            } finally {
+                runningTasks.remove(future);
             }
         };
 
         try {
             // Submit to virtual thread executor - each task gets its own virtual thread
             virtualThreadExecutor.execute(wrappedTask);
-            
-            // Schedule timeout enforcement if configured
-            Duration timeout = config.getTaskTimeout();
-            if (timeout != null && !timeout.isZero() && !timeout.isNegative()) {
-                timeoutScheduler.schedule(() -> {
+        } catch (RejectedExecutionException e) {
+            runningTasks.remove(future);
+            if (future.complete(TaskResult.failure(taskId, e, Instant.now(), Instant.now()))) {
+                failedCount.incrementAndGet();
+            }
+            return future;
+        }
+
+        // Schedule timeout enforcement if configured
+        // This is outside the execute try-catch so a scheduler rejection during
+        // concurrent shutdown doesn't mark an already-running task as failed
+        Duration timeout = config.getTaskTimeout();
+        if (timeout != null && !timeout.isZero() && !timeout.isNegative()) {
+            try {
+                ScheduledFuture<?> timeoutFuture = timeoutScheduler.schedule(() -> {
                     if (!future.isDone()) {
                         TimeoutException timeoutEx = new TimeoutException(
                             "Task " + taskId + " exceeded timeout of " + timeout);
-                        Instant startTime = startTimeHolder[0] != null
-                            ? startTimeHolder[0]
-                            : (queuedTimeHolder[0] != null ? queuedTimeHolder[0] : Instant.now());
+                        Instant startTime = startTimeHolder.get() != null
+                            ? startTimeHolder.get()
+                            : (queuedTimeHolder.get() != null ? queuedTimeHolder.get() : Instant.now());
                         if (future.complete(TaskResult.failure(taskId, timeoutEx, startTime, Instant.now()))) {
                             timedOutCount.incrementAndGet();
                             failedCount.incrementAndGet();
                             // Interrupt the executing thread if it's still running
-                            Thread thread = executingThread[0];
+                            Thread thread = executingThread.get();
                             if (thread != null) {
                                 thread.interrupt();
                             }
                         }
                     }
                 }, timeout.toMillis(), TimeUnit.MILLISECONDS);
+                // Cancel the timeout callback when the task completes early
+                future.whenComplete((result, ex) -> timeoutFuture.cancel(false));
+            } catch (RejectedExecutionException e) {
+                logger.log(System.Logger.Level.WARNING,
+                    "Timeout scheduling rejected for task {0} during shutdown — task runs without timeout enforcement",
+                    taskId);
             }
-        } catch (RejectedExecutionException e) {
-            future.complete(TaskResult.failure(taskId, e, Instant.now(), Instant.now()));
-            failedCount.incrementAndGet();
         }
 
         return future;
@@ -233,8 +269,12 @@ public class VirtualThreadExecutor implements AutoCloseable {
      * @return list of CompletableFutures
      */
     public <T> List<CompletableFuture<TaskResult<T>>> submitAll(List<TaskSubmission<T>> tasks) {
+        Objects.requireNonNull(tasks, "tasks cannot be null");
         return tasks.stream()
-            .map(t -> submit(t.getTaskId(), t.getTask()))
+            .map(t -> {
+                Objects.requireNonNull(t, "task submission cannot be null");
+                return submit(t.getTaskId(), t.getTask());
+            })
             .collect(Collectors.toList());
     }
 
@@ -246,8 +286,11 @@ public class VirtualThreadExecutor implements AutoCloseable {
      * @return list of TaskResults
      */
     public <T> List<TaskResult<T>> awaitAll(List<CompletableFuture<TaskResult<T>>> futures) {
+        Objects.requireNonNull(futures, "futures cannot be null");
         List<TaskResult<T>> results = new ArrayList<>(futures.size());
-        for (CompletableFuture<TaskResult<T>> f : futures) {
+        for (int i = 0; i < futures.size(); i++) {
+            CompletableFuture<TaskResult<T>> f = Objects.requireNonNull(
+                futures.get(i), "future at index " + i + " cannot be null");
             try {
                 results.add(f.join());
             } catch (CompletionException e) {
@@ -264,6 +307,8 @@ public class VirtualThreadExecutor implements AutoCloseable {
      */
     public <T> List<TaskResult<T>> awaitAll(List<CompletableFuture<TaskResult<T>>> futures,
                                              Duration timeout) throws TimeoutException {
+        Objects.requireNonNull(futures, "futures cannot be null");
+        Objects.requireNonNull(timeout, "timeout cannot be null");
         try {
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
                 .get(timeout.toMillis(), TimeUnit.MILLISECONDS);
@@ -276,6 +321,14 @@ public class VirtualThreadExecutor implements AutoCloseable {
             for (CompletableFuture<TaskResult<T>> f : futures) {
                 if (!f.isDone()) {
                     f.cancel(true);
+                    // Interrupt the virtual thread running the task
+                    AtomicReference<Thread> threadRef = runningTasks.remove(f);
+                    if (threadRef != null) {
+                        Thread thread = threadRef.get();
+                        if (thread != null) {
+                            thread.interrupt();
+                        }
+                    }
                 }
             }
             throw new TimeoutException(e.getMessage());
@@ -354,6 +407,7 @@ public class VirtualThreadExecutor implements AutoCloseable {
     public void shutdown() {
         if (shutdown.compareAndSet(false, true)) {
             virtualThreadExecutor.shutdown();
+            timeoutScheduler.shutdown();
         }
     }
 
@@ -363,6 +417,7 @@ public class VirtualThreadExecutor implements AutoCloseable {
      */
     public List<Runnable> shutdownNow() {
         shutdown.set(true);
+        timeoutScheduler.shutdownNow();
         return virtualThreadExecutor.shutdownNow();
     }
 
@@ -371,7 +426,13 @@ public class VirtualThreadExecutor implements AutoCloseable {
      * or the timeout occurs.
      */
     public boolean awaitTermination(Duration timeout) throws InterruptedException {
-        return virtualThreadExecutor.awaitTermination(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        long deadlineNanos = System.nanoTime() + timeout.toNanos();
+        boolean executorTerminated = virtualThreadExecutor.awaitTermination(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        long remainingNanos = deadlineNanos - System.nanoTime();
+        boolean schedulerTerminated = remainingNanos > 0
+            ? timeoutScheduler.awaitTermination(remainingNanos, TimeUnit.NANOSECONDS)
+            : timeoutScheduler.isTerminated();
+        return executorTerminated && schedulerTerminated;
     }
 
     /**
@@ -385,7 +446,7 @@ public class VirtualThreadExecutor implements AutoCloseable {
      * Returns true if all tasks have completed following shut down.
      */
     public boolean isTerminated() {
-        return virtualThreadExecutor.isTerminated();
+        return virtualThreadExecutor.isTerminated() && timeoutScheduler.isTerminated();
     }
 
     @Override
