@@ -178,7 +178,7 @@ public class PooledExecutorService<R extends PooledResource<T>, T> implements Au
      * @throws TimeoutException if the timeout is exceeded
      */
     public <V> List<TaskResult<V>> executeAll(List<OperationSubmission<R, V>> operations,
-                                               Duration timeout) throws TimeoutException {
+                                               Duration timeout) throws TimeoutException, InterruptedException {
         return executor.awaitAll(executeAllAsync(operations), timeout);
     }
 

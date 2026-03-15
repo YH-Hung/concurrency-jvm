@@ -217,6 +217,8 @@ class BoundedConcurrencyExecutorTest {
         TaskResult<String> result = future.join();
 
         assertTrue(result.isFailure());
+        assertEquals(1, executor.getSubmittedCount(), "Rejected task should be counted as submitted");
+        assertEquals(1, executor.getFailedCount(), "Rejected task should be counted as failed");
     }
 
     @Test
@@ -658,6 +660,108 @@ class BoundedConcurrencyExecutorTest {
             .queueCapacity(10)
             .build();
         assertEquals(2, config.getCorePoolSize());
+    }
+
+    @Test
+    @Timeout(10)
+    void shouldHandleUserTaskThrowingError() throws Exception {
+        executor = new BoundedConcurrencyExecutor();
+
+        CompletableFuture<TaskResult<String>> future = executor.submit("error-task", () -> {
+            throw new AssertionError("Simulated Error from user code");
+        });
+
+        TaskResult<String> result = future.get(5, TimeUnit.SECONDS);
+
+        assertTrue(result.isFailure());
+        assertTrue(result.getException().isPresent());
+        assertTrue(result.getException().get() instanceof AssertionError);
+        assertEquals("Simulated Error from user code", result.getException().get().getMessage());
+        // Brief wait for worker thread to finish stats bookkeeping after future.complete()
+        Thread.sleep(100);
+        assertEquals(1, executor.getFailedCount());
+    }
+
+    @Test
+    @Timeout(10)
+    void shouldCompletePendingFuturesOnShutdownNow() throws Exception {
+        executor = new BoundedConcurrencyExecutor(
+            ExecutorConfig.builder()
+                .concurrency(1)
+                .queueCapacity(100)
+                .build()
+        );
+
+        CountDownLatch blockingTaskStarted = new CountDownLatch(1);
+        CountDownLatch blockingTaskRelease = new CountDownLatch(1);
+
+        // Submit a blocking task to hold the semaphore
+        CompletableFuture<TaskResult<String>> blockingFuture = executor.submit("blocking", () -> {
+            blockingTaskStarted.countDown();
+            try {
+                blockingTaskRelease.await(30, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return "blocked";
+        });
+
+        blockingTaskStarted.await(5, TimeUnit.SECONDS);
+
+        // Submit additional tasks that will be queued
+        List<CompletableFuture<TaskResult<String>>> queuedFutures = new ArrayList<>();
+        for (int i = 0; i < 5; i++) {
+            queuedFutures.add(executor.submit("queued-" + i, () -> "should-not-run"));
+        }
+
+        // shutdownNow should complete all pending futures
+        executor.shutdownNow();
+
+        // All queued futures should resolve with proper TaskResult (not exceptional completion)
+        for (CompletableFuture<TaskResult<String>> f : queuedFutures) {
+            assertTrue(f.isDone(), "Queued future should be completed after shutdownNow");
+            // join() should NOT throw -- futures should contain TaskResult.failure, not be exceptional
+            TaskResult<String> result = f.join();
+            assertTrue(result.isFailure(), "Queued task should be a failure result");
+            assertTrue(result.getException().get() instanceof CancellationException);
+            assertTrue(result.getTaskId().startsWith("queued-"), "Task identity should be preserved");
+        }
+
+        // The blocking future should also resolve
+        assertTrue(blockingFuture.isDone(), "Blocking future should be completed after shutdownNow");
+    }
+
+    @Test
+    @Timeout(10)
+    void shouldInterruptRunningTaskOnDirectCancel() throws Exception {
+        executor = new BoundedConcurrencyExecutor(
+            ExecutorConfig.builder()
+                .concurrency(5)
+                .build()
+        );
+
+        AtomicBoolean wasInterrupted = new AtomicBoolean(false);
+        CountDownLatch taskStarted = new CountDownLatch(1);
+
+        CompletableFuture<TaskResult<String>> future = executor.submit("cancel-me", () -> {
+            taskStarted.countDown();
+            try {
+                Thread.sleep(30000);
+            } catch (InterruptedException e) {
+                wasInterrupted.set(true);
+                Thread.currentThread().interrupt();
+            }
+            return "done";
+        });
+
+        taskStarted.await(5, TimeUnit.SECONDS);
+
+        // Cancel the future directly
+        future.cancel(true);
+
+        // Give the interrupt a moment to propagate
+        Thread.sleep(200);
+        assertTrue(wasInterrupted.get(), "Running task should be interrupted on direct cancel(true)");
     }
 
     @Test

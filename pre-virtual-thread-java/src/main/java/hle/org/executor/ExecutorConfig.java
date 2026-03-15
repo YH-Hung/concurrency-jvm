@@ -176,8 +176,10 @@ public class ExecutorConfig {
         }
 
         /**
-         * Sets the maximum time a single task can run before being cancelled.
-         * 
+         * Sets the maximum wall-clock time from task submission before it is cancelled.
+         * This includes time spent queued and waiting for a concurrency permit,
+         * not just active execution time.
+         *
          * Default: 5 minutes
          */
         public Builder taskTimeout(Duration taskTimeout) {

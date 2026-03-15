@@ -71,8 +71,8 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
     // Counter for auto-generated task IDs (separate from submittedCount to avoid race condition)
     private final AtomicLong autoTaskIdCounter = new AtomicLong(0);
     
-    // Maps futures to their executing threads for cancellation support
-    private final ConcurrentHashMap<CompletableFuture<?>, AtomicReference<Thread>> runningTasks = new ConcurrentHashMap<>();
+    // Maps futures to their task handles for cancellation, shutdown completion, and identity tracking
+    private final ConcurrentHashMap<CompletableFuture<?>, TaskHandle> runningTasks = new ConcurrentHashMap<>();
 
     // Statistics
     private final AtomicLong submittedCount = new AtomicLong(0);
@@ -85,6 +85,7 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
      * Creates a new executor with the given configuration.
      */
     public BoundedConcurrencyExecutor(ExecutorConfig config) {
+        Objects.requireNonNull(config, "config cannot be null");
         this.config = config;
         this.concurrencyLimiter = new Semaphore(config.getConcurrency(), true);
         this.workQueue = new LinkedBlockingQueue<>(config.getQueueCapacity());
@@ -125,11 +126,14 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
         this.workerPool = threadPool;
         
         // Create a single-threaded scheduler for task timeout enforcement
-        this.timeoutScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1, r -> {
             Thread t = new Thread(r, config.getThreadNamePrefix() + "-timeout-scheduler");
             t.setDaemon(true);
             return t;
         });
+        // Remove cancelled timeout tasks from the queue immediately to avoid memory buildup
+        scheduler.setRemoveOnCancelPolicy(true);
+        this.timeoutScheduler = scheduler;
     }
 
     /**
@@ -185,19 +189,31 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
         Objects.requireNonNull(task, "task cannot be null");
         
         if (shutdown.get()) {
+            submittedCount.incrementAndGet();
+            failedCount.incrementAndGet();
             return CompletableFuture.completedFuture(
                 TaskResult.failure(taskId, new RejectedExecutionException("Executor is shutdown"),
                     Instant.now(), Instant.now())
             );
         }
 
-        submittedCount.incrementAndGet();
         CompletableFuture<TaskResult<T>> future = new CompletableFuture<>();
-        AtomicReference<Thread> executingThread = new AtomicReference<>();
+        TaskHandle handle = new TaskHandle(taskId);
         AtomicReference<Instant> startTimeHolder = new AtomicReference<>();
+        AtomicReference<ScheduledFuture<?>> timeoutFutureHolder = new AtomicReference<>();
 
-        // Register for cancellation support (Fix 2)
-        runningTasks.put(future, executingThread);
+        // Register for cancellation support and shutdown completion
+        runningTasks.put(future, handle);
+
+        // Propagate future cancellation to thread interrupt
+        future.whenComplete((result, ex) -> {
+            if (future.isCancelled()) {
+                Thread thread = handle.executingThread.get();
+                if (thread != null) {
+                    thread.interrupt();
+                }
+            }
+        });
 
         Runnable wrappedTask = () -> {
             Instant queuedTime = Instant.now();
@@ -205,8 +221,15 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
                 // Acquire semaphore to respect concurrency limit
                 concurrencyLimiter.acquire();
 
-                // If future is already done (e.g. timed out), skip execution (Fix 1)
+                // Publish thread BEFORE isDone check to close the race window where
+                // timeout/cancel could miss the interrupt between the two operations
+                handle.executingThread.set(Thread.currentThread());
+
+                // If future is already done (e.g. timed out), skip execution
                 if (future.isDone()) {
+                    handle.executingThread.set(null);
+                    // Clear interrupt flag that may have been set by timeout/cancel
+                    Thread.interrupted();
                     concurrencyLimiter.release();
                     return;
                 }
@@ -214,7 +237,6 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
                 // Capture actual execution start time (after semaphore wait)
                 Instant startTime = Instant.now();
                 startTimeHolder.set(startTime);
-                executingThread.set(Thread.currentThread());
                 activeCount.incrementAndGet();
 
                 try {
@@ -224,7 +246,7 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
                     if (future.complete(TaskResult.success(taskId, result, startTime, endTime))) {
                         completedCount.incrementAndGet();
                     }
-                } catch (Exception e) {
+                } catch (Throwable e) {
                     Instant endTime = Instant.now();
                     if (future.complete(TaskResult.failure(taskId, e, startTime, endTime))) {
                         failedCount.incrementAndGet();
@@ -246,11 +268,15 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
 
         try {
             workerPool.execute(wrappedTask);
+            submittedCount.incrementAndGet();
 
             // Schedule timeout enforcement if configured
+            // Note: timeout measures wall-clock time from submission, not from execution start.
+            // This provides SLA-style guarantees from the caller's perspective. Under heavy load,
+            // tasks may time out while still queued, which is the intended behavior.
             Duration timeout = config.getTaskTimeout();
             if (timeout != null && !timeout.isZero() && !timeout.isNegative()) {
-                timeoutScheduler.schedule(() -> {
+                ScheduledFuture<?> timeoutFuture = timeoutScheduler.schedule(() -> {
                     if (!future.isDone()) {
                         TimeoutException timeoutEx = new TimeoutException(
                             "Task " + taskId + " exceeded timeout of " + timeout);
@@ -259,16 +285,20 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
                             timedOutCount.incrementAndGet();
                             failedCount.incrementAndGet();
                             // Interrupt the executing thread if it's still running
-                            Thread thread = executingThread.get();
+                            Thread thread = handle.executingThread.get();
                             if (thread != null) {
                                 thread.interrupt();
                             }
                         }
                     }
                 }, timeout.toMillis(), TimeUnit.MILLISECONDS);
+                timeoutFutureHolder.set(timeoutFuture);
+                // Cancel the timeout job when the task completes early to avoid memory buildup
+                future.whenComplete((result, ex) -> timeoutFuture.cancel(false));
             }
         } catch (RejectedExecutionException e) {
             runningTasks.remove(future);
+            submittedCount.incrementAndGet();
             if (future.complete(TaskResult.failure(taskId, e, Instant.now(), Instant.now()))) {
                 failedCount.incrementAndGet();
             }
@@ -294,6 +324,7 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
      * @return list of CompletableFutures
      */
     public <T> List<CompletableFuture<TaskResult<T>>> submitAll(List<TaskSubmission<T>> tasks) {
+        Objects.requireNonNull(tasks, "tasks cannot be null");
         return tasks.stream()
             .map(t -> submit(t.getTaskId(), t.getTask()))
             .collect(Collectors.toList());
@@ -307,13 +338,17 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
      * @return list of TaskResults
      */
     public <T> List<TaskResult<T>> awaitAll(List<CompletableFuture<TaskResult<T>>> futures) {
+        Objects.requireNonNull(futures, "futures cannot be null");
         List<TaskResult<T>> results = new ArrayList<>(futures.size());
         for (CompletableFuture<TaskResult<T>> f : futures) {
             try {
                 results.add(f.join());
             } catch (CompletionException e) {
+                // Defensive: submit() always resolves futures to TaskResult values, so this
+                // path is only reachable if the future was completed externally (e.g. shutdownNow)
                 results.add(TaskResult.<T>failure("unknown", e.getCause(), Instant.now(), Instant.now()));
             } catch (CancellationException e) {
+                // Defensive: reachable if caller or awaitAll(timeout) cancelled the future
                 results.add(TaskResult.<T>failure("unknown", e, Instant.now(), Instant.now()));
             }
         }
@@ -324,23 +359,29 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
      * Waits for all futures to complete with a timeout.
      */
     public <T> List<TaskResult<T>> awaitAll(List<CompletableFuture<TaskResult<T>>> futures,
-                                             Duration timeout) throws TimeoutException {
+                                             Duration timeout) throws TimeoutException, InterruptedException {
+        Objects.requireNonNull(futures, "futures cannot be null");
+        Objects.requireNonNull(timeout, "timeout cannot be null");
         try {
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
                 .get(timeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new RuntimeException("Interrupted while waiting for tasks", e);
+            throw e;
         } catch (ExecutionException e) {
             // submit() wraps all outcomes in TaskResult, so this is defensive only
         } catch (java.util.concurrent.TimeoutException e) {
             for (CompletableFuture<TaskResult<T>> f : futures) {
                 if (!f.isDone()) {
-                    f.cancel(true);
-                    // Also interrupt the actual executing thread (Fix 2)
-                    AtomicReference<Thread> threadRef = runningTasks.remove(f);
-                    if (threadRef != null) {
-                        Thread thread = threadRef.get();
+                    // Complete with proper TaskResult.failure to preserve API contract
+                    TaskHandle handle = runningTasks.remove(f);
+                    String id = handle != null ? handle.taskId : "unknown";
+                    Instant now = Instant.now();
+                    f.complete(TaskResult.failure(id,
+                        new TimeoutException("Batch await timed out"), now, now));
+                    // Interrupt the actual executing thread
+                    if (handle != null) {
+                        Thread thread = handle.executingThread.get();
                         if (thread != null) {
                             thread.interrupt();
                         }
@@ -441,10 +482,22 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
      * Attempts to stop all actively executing tasks and halts the processing
      * of waiting tasks.
      */
+    @SuppressWarnings("unchecked")
     public List<Runnable> shutdownNow() {
         shutdown.set(true);
         timeoutScheduler.shutdownNow();
-        return workerPool.shutdownNow();
+        List<Runnable> drained = workerPool.shutdownNow();
+        // Complete any futures whose wrappedTasks were drained or will never run,
+        // preserving the TaskResult contract so callers never see exceptional completion
+        for (java.util.Map.Entry<CompletableFuture<?>, TaskHandle> entry : runningTasks.entrySet()) {
+            CompletableFuture future = entry.getKey();
+            TaskHandle handle = entry.getValue();
+            Instant now = Instant.now();
+            future.complete(TaskResult.failure(handle.taskId,
+                new CancellationException("Executor shut down"), now, now));
+        }
+        runningTasks.clear();
+        return drained;
     }
 
     /**
@@ -452,14 +505,19 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
      * or the timeout occurs.
      */
     public boolean awaitTermination(Duration timeout) throws InterruptedException {
+        Objects.requireNonNull(timeout, "timeout cannot be null");
         long deadlineNanos = System.nanoTime() + timeout.toNanos();
         boolean workerTerminated = workerPool.awaitTermination(timeout.toMillis(), TimeUnit.MILLISECONDS);
-        // Once workers are done, timeout scheduler is no longer needed (Fix 5)
-        timeoutScheduler.shutdownNow();
-        long remainingNanos = deadlineNanos - System.nanoTime();
-        boolean schedulerTerminated = timeoutScheduler.awaitTermination(
-            Math.max(0, remainingNanos), TimeUnit.NANOSECONDS);
-        return workerTerminated && schedulerTerminated;
+        if (workerTerminated) {
+            // Only shut down timeout scheduler once workers are done;
+            // in-flight tasks may still need timeout enforcement
+            timeoutScheduler.shutdownNow();
+            long remainingNanos = deadlineNanos - System.nanoTime();
+            boolean schedulerTerminated = timeoutScheduler.awaitTermination(
+                Math.max(0, remainingNanos), TimeUnit.NANOSECONDS);
+            return schedulerTerminated;
+        }
+        return false;
     }
 
     /**
@@ -473,7 +531,7 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
      * Returns true if all tasks have completed following shut down.
      */
     public boolean isTerminated() {
-        return workerPool.isTerminated();
+        return workerPool.isTerminated() && timeoutScheduler.isTerminated();
     }
 
     @Override
@@ -490,6 +548,18 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
     }
 
     /**
+     * Internal handle associating a tracked future with its task identity and executing thread.
+     */
+    private static class TaskHandle {
+        final String taskId;
+        final AtomicReference<Thread> executingThread = new AtomicReference<>();
+
+        TaskHandle(String taskId) {
+            this.taskId = taskId;
+        }
+    }
+
+    /**
      * Helper class for submitting tasks with IDs.
      */
     public static class TaskSubmission<T> {
@@ -497,8 +567,8 @@ public class BoundedConcurrencyExecutor implements AutoCloseable {
         private final Supplier<T> task;
 
         public TaskSubmission(String taskId, Supplier<T> task) {
-            this.taskId = taskId;
-            this.task = task;
+            this.taskId = Objects.requireNonNull(taskId, "taskId cannot be null");
+            this.task = Objects.requireNonNull(task, "task cannot be null");
         }
 
         public String getTaskId() {
