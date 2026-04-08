@@ -207,6 +207,27 @@ class PooledExecutorServiceTest {
         assertEquals(5, service.getResourcePool().getMaxPoolSize());
     }
 
+    @Test
+    @Timeout(10)
+    void defaultConstructorCreatesWorkingService() throws Exception {
+        // PooledExecutorService(Supplier) — uses pool size 10 and concurrency 10
+        PooledExecutorService<SimulatedCorbaClient, String> defaultService =
+            new PooledExecutorService<>(
+                () -> SimulatedCorbaClient.builder()
+                    .latency(1, 5)
+                    .failureRate(0)
+                    .verbose(false)
+                    .build()
+            );
+        try {
+            TaskResult<String> result = defaultService.execute("default-ctor",
+                client -> client.execute("hello"));
+            assertTrue(result.isSuccess());
+        } finally {
+            defaultService.close();
+        }
+    }
+
     /**
      * Helper to create a service with common settings.
      */
