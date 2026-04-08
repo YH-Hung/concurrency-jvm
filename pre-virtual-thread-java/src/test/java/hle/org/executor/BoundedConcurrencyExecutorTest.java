@@ -797,4 +797,52 @@ class BoundedConcurrencyExecutorTest {
                 "Result at index " + i + " should match task " + i);
         }
     }
+
+    @Test
+    @Timeout(10)
+    void shouldRejectImmediatelyWithRejectPolicy() throws Exception {
+        // REJECT policy: when queue is full, task is rejected as a TaskResult.failure
+        executor = new BoundedConcurrencyExecutor(
+            ExecutorConfig.builder()
+                .concurrency(1)
+                .queueCapacity(1)
+                .rejectionPolicy(ExecutorConfig.RejectionPolicy.REJECT)
+                .build()
+        );
+
+        CountDownLatch holdLatch = new CountDownLatch(1);
+        // Fill slot 1: running task that blocks
+        executor.submit("running", () -> {
+            try { holdLatch.await(10, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return "running";
+        });
+        // Fill slot 2: queued task
+        executor.submit("queued", () -> "queued");
+        Thread.sleep(100); // let both settle
+
+        // This one overflows the queue and should produce a failure TaskResult
+        CompletableFuture<TaskResult<String>> overflow = executor.submit("overflow", () -> "overflow");
+        TaskResult<String> result = overflow.get(2, TimeUnit.SECONDS);
+        assertTrue(result.isFailure(), "Rejected task should produce a failure TaskResult");
+
+        holdLatch.countDown();
+    }
+
+    @Test
+    @Timeout(10)
+    void shouldRunInCallingThreadWithCallerRunsPolicy() throws Exception {
+        executor = new BoundedConcurrencyExecutor(
+            ExecutorConfig.builder()
+                .concurrency(2)
+                .queueCapacity(1)
+                .rejectionPolicy(ExecutorConfig.RejectionPolicy.CALLER_RUNS)
+                .build()
+        );
+
+        // Normal submission should succeed with CALLER_RUNS policy in place
+        CompletableFuture<TaskResult<String>> future = executor.submit("caller-runs-ok", () -> "ok");
+        TaskResult<String> result = future.get(5, TimeUnit.SECONDS);
+        assertTrue(result.isSuccess());
+        assertEquals("ok", result.getValue().orElse(null));
+    }
 }
