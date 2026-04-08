@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -833,16 +834,58 @@ class BoundedConcurrencyExecutorTest {
     void shouldRunInCallingThreadWithCallerRunsPolicy() throws Exception {
         executor = new BoundedConcurrencyExecutor(
             ExecutorConfig.builder()
-                .concurrency(2)
+                .concurrency(1)
                 .queueCapacity(1)
                 .rejectionPolicy(ExecutorConfig.RejectionPolicy.CALLER_RUNS)
                 .build()
         );
 
-        // Normal submission should succeed with CALLER_RUNS policy in place
-        CompletableFuture<TaskResult<String>> future = executor.submit("caller-runs-ok", () -> "ok");
-        TaskResult<String> result = future.get(5, TimeUnit.SECONDS);
-        assertTrue(result.isSuccess());
-        assertEquals("ok", result.getValue().orElse(null));
+        CountDownLatch holdLatch = new CountDownLatch(1);
+        AtomicReference<String> capturedThreadName = new AtomicReference<>();
+
+        // Fill slot 1: running task that blocks (holds the semaphore)
+        executor.submit("running", () -> {
+            try { holdLatch.await(10, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return "running";
+        });
+
+        // Fill slot 2: queued task
+        executor.submit("queued", () -> "queued");
+        Thread.sleep(100); // let both settle into their slots
+
+        // Submit this in a background thread so CALLER_RUNS can execute waiting for semaphore
+        // while the test thread controls the holdLatch
+        Thread submitterThread = new Thread("test-submitter-thread") {
+            @Override
+            public void run() {
+                try {
+                    // This 3rd task overflows the queue: CALLER_RUNS executes it in this thread
+                    // The wrapped task will acquire the semaphore (after the first task releases it)
+                    // and then execute the user task synchronously in this thread
+                    executor.submit("caller", () -> {
+                        capturedThreadName.set(Thread.currentThread().getName());
+                        return "caller-task-result";
+                    });
+                } catch (Exception e) {
+                    // Submission failed
+                    capturedThreadName.set("exception: " + e.getMessage());
+                }
+            }
+        };
+        submitterThread.start();
+
+        // Wait a moment for submitter thread to submit the 3rd task
+        Thread.sleep(100);
+
+        // The submitter thread should be blocked in CALLER_RUNS, waiting for the semaphore
+        // Release holdLatch so the first task finishes and releases the semaphore
+        holdLatch.countDown();
+
+        // Wait for the submitter thread to complete (should acquire semaphore, run task, and finish)
+        submitterThread.join(3000);
+
+        // Verify the task ran synchronously in the submitter thread
+        assertEquals("test-submitter-thread", capturedThreadName.get(),
+            "CALLER_RUNS task should run in the calling thread, not a pool worker");
     }
 }
