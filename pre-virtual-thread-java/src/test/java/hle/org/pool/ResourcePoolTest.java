@@ -266,6 +266,63 @@ class ResourcePoolTest {
         });
     }
 
+    @Test
+    void defaultConstructorUsesDefaultConfig() {
+        pool = new ResourcePool<>(() -> new TestResource(createCount.incrementAndGet()));
+        String result = pool.execute(r -> r.getId());
+        assertNotNull(result);
+        assertTrue(result.startsWith("test-"));
+    }
+
+    @Test
+    void shouldExecuteWithCustomTimeout() {
+        pool = new ResourcePool<>(
+            () -> new TestResource(createCount.incrementAndGet()),
+            ResourcePoolConfig.builder().maxPoolSize(2).build()
+        );
+
+        String result = pool.executeWithTimeout(Duration.ofSeconds(5), r -> "timeout-result");
+        assertEquals("timeout-result", result);
+    }
+
+    @Test
+    void shouldThrowOnExecuteWithTimeoutWhenClosed() {
+        pool = new ResourcePool<>(
+            () -> new TestResource(createCount.incrementAndGet()),
+            ResourcePoolConfig.defaultConfig()
+        );
+        pool.close();
+
+        assertThrows(ResourcePoolException.class, () ->
+            pool.executeWithTimeout(Duration.ofSeconds(1), r -> "val"));
+    }
+
+    @Test
+    void shouldReturnFormattedStats() {
+        pool = new ResourcePool<>(
+            () -> new TestResource(createCount.incrementAndGet()),
+            ResourcePoolConfig.builder().maxPoolSize(5).build()
+        );
+
+        pool.execute(r -> r.getId());
+
+        String stats = pool.getStats();
+        assertNotNull(stats);
+        assertTrue(stats.contains("active="), "Expected 'active=' in: " + stats);
+        assertTrue(stats.contains("idle="), "Expected 'idle=' in: " + stats);
+        assertTrue(stats.contains("max="), "Expected 'max=' in: " + stats);
+    }
+
+    @Test
+    void shouldReportZeroWaitingCountWhenIdle() {
+        pool = new ResourcePool<>(
+            () -> new TestResource(createCount.incrementAndGet()),
+            ResourcePoolConfig.builder().maxPoolSize(2).build()
+        );
+
+        assertEquals(0, pool.getWaitingCount());
+    }
+
     /**
      * Simple test implementation of PooledResource.
      */
