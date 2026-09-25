@@ -1,6 +1,6 @@
 # db-work-queue — Design
 
-Date: 2026-09-21 (revision 6: 2026-09-23)
+Date: 2026-09-21 (revision 7: 2026-09-25)
 Status: Architecture accepted. Approved for the Phase 1 Db2 spike. Production approval
 pending review of this revision. Every time value in §5.3 and §7 is a conditional target
 pending validation by the Phase 1 spike, review of the §5.3 timing argument,
@@ -91,7 +91,8 @@ WORK_QUEUE_META                    -- exactly one row
 
 WORK_ITEM
   ID            BIGINT        NOT NULL GENERATED ALWAYS AS IDENTITY, PRIMARY KEY
-  OPERATION_ID  VARCHAR(64)   NOT NULL UNIQUE      -- upstream-assigned, immutable (§5.4)
+  OPERATION_ID  VARCHAR(65)   NOT NULL             -- upstream-assigned, immutable, canonical format (§5.4)
+                CHECK (LENGTH(OPERATION_ID) BETWEEN 1 AND 64 AND NOT REGEXP_LIKE(OPERATION_ID, '[^!-~]'))
   PAYLOAD       VARCHAR(1000) NOT NULL
   STATUS        VARCHAR(10)   NOT NULL DEFAULT 'PENDING'
                               CHECK (STATUS IN ('PENDING','CLAIMED','DONE','FAILED'))
@@ -103,13 +104,30 @@ WORK_ITEM
   LAST_ERROR    VARCHAR(1000)
   CREATED_AT    TIMESTAMP     NOT NULL DEFAULT CURRENT TIMESTAMP
   UPDATED_AT    TIMESTAMP     NOT NULL DEFAULT CURRENT TIMESTAMP
+  UNIQUE INDEX UX_WORK_ITEM_OPERATION_ID (OPERATION_ID, LENGTH(OPERATION_ID))   -- exact identity
   INDEX IX_WORK_ITEM_CLAIM (STATUS, AVAILABLE_AT)
 ```
 
 **Upstream insert contract:** `INSERT INTO WORK_ITEM (OPERATION_ID, PAYLOAD) VALUES (?, ?)`.
-Defaults make the row immediately claimable; rows may be inserted at any time. A duplicate
-`OPERATION_ID` fails with a unique-key violation, which the producer treats as "already
-enqueued". `OPERATION_ID` rules are in §5.4.
+Defaults make the row immediately claimable; rows may be inserted at any time. Only an
+identical `OPERATION_ID` fails with a unique-key violation (SQLSTATE 23505), which the
+producer treats as "already enqueued". An `OPERATION_ID` outside the §5.4 format fails with a
+check violation (23513), or with a length error (22001) when it is longer than 65 bytes
+(UTF-8; fewer characters for non-ASCII input) and the excess is not all blanks: a producer
+bug, never "already enqueued". Nothing is stored in either case. `OPERATION_ID` rules are
+in §5.4.
+
+**Why the column is `VARCHAR(65)`:** on assignment, Db2 silently cuts excess trailing blanks
+off a value that is too long for the column, before the `CHECK` and the unique key see it.
+In a `VARCHAR(64)` column, 64 characters plus a blank were stored as the 64 characters, or
+failed as a duplicate of them. One byte wider, any value over 65 bytes that ends in blanks
+arrives as 65 bytes: too long if ASCII, non-ASCII otherwise, so it fails the `CHECK`.
+
+**Why the unique key includes the length:** Db2 compares strings blank-padded, so
+`'order-1'` equals `'order-1 '`, and it checks uniqueness before the `CHECK`. With a unique
+key on `OPERATION_ID` alone, a malformed id with trailing blanks fails as a duplicate of the
+canonical one and is dropped as "already enqueued". With the length in the key, only
+identical ids collide, and the malformed one fails the `CHECK`.
 
 **`ID` is internal.** Identity values can repeat after a table is recreated or restored,
 so `ID` is used only for row addressing inside the engine (always together with
@@ -381,15 +399,16 @@ table's physical row ids.
 
 ```java
 public record IdempotencyKey(String namespace, String operationId) {
-    // namespace: ^[a-z0-9][a-z0-9-]{0,31}$ (no ':'); operationId: 1..64 chars, any content.
+    // namespace: ^[a-z0-9][a-z0-9-]{0,31}$ (no ':'); operationId: ^[!-~]{1,64}$ (printable ASCII, no spaces).
     // Both validated in the constructor.
     public String value() { return namespace + ":" + operationId; }
 }
 
 public interface ExternalService {
     /**
-     * Must be idempotent on key.value(): repeated calls apply the effect at most once and
-     * return the result of the first application. Must return or throw within timeout.
+     * Must be idempotent on key.value(), compared exactly (case-sensitive): repeated calls
+     * apply the effect at most once and return the result of the first application. Must
+     * return or throw within timeout.
      * Should respond to interruption.
      */
     CallResult call(IdempotencyKey key, long claimToken, String payload, Duration timeout)
@@ -398,14 +417,23 @@ public interface ExternalService {
 ```
 
 **Key encoding.** `value()` is unambiguous because the namespace can never contain `:`,
-so the first `:` is always the separator and `OPERATION_ID` may contain anything,
-including further colons. The namespace rule is enforced three times: the `CHECK`
-constraint on `WORK_QUEUE_META`, the full pattern in `SchemaCheck` at startup, and the
-`IdempotencyKey` constructor. Downstreams that store the key as one string use `value()`;
-downstreams that store the two parts separately may use the record's fields directly.
+so the first `:` is always the separator and `OPERATION_ID` may contain further colons.
+The namespace rule is enforced three times: the `CHECK` constraint on `WORK_QUEUE_META`,
+the full pattern in `SchemaCheck` at startup, and the `IdempotencyKey` constructor.
+Downstreams that store the key as one string use `value()`; downstreams that store the two
+parts separately may use the record's fields directly.
 
 **Operation identity (`OPERATION_ID`):**
 
+- Format: 1–64 printable ASCII characters (U+0021–U+007E): letters, digits and
+  punctuation; no spaces, control characters or non-ASCII. One character is one byte, so
+  byte lengths (the default `STRING_UNITS=SYSTEM`) equal character lengths, and
+  blank-padded comparison can never merge two valid ids, here or in a downstream store.
+  A producer with other business keys hashes or encodes them. Enforced by
+  `CK_WORK_ITEM_OPERATION_ID` on insert and by the `IdempotencyKey` constructor.
+- Case-sensitive: `order-1` and `ORDER-1` are different operations. Precondition: the
+  database uses the `IDENTITY` collation (the IT database does); a case-insensitive
+  collation would merge them under the unique key.
 - Assigned by the upstream producer and **persisted with the business event** before the
   row is inserted; recommended: a UUID generated when the business event is created, or a
   deterministic business key (e.g. `order-8812:charge`).
@@ -520,21 +548,26 @@ One claim operation, one transaction, two selections in claim order (§5.1):
 ```sql
 -- A: expired claims first (recovery)
 SELECT ID, OPERATION_ID, PAYLOAD, CLAIM_TOKEN FROM FINAL TABLE (
-  UPDATE (SELECT * FROM WORK_ITEM
+  UPDATE (SELECT ID, OPERATION_ID, PAYLOAD, STATUS, OWNER, CLAIM_TOKEN, ATTEMPTS, AVAILABLE_AT, UPDATED_AT
+          FROM WORK_ITEM
           WHERE STATUS = 'CLAIMED' AND AVAILABLE_AT <= CURRENT TIMESTAMP AND ATTEMPTS < :max
-          ORDER BY AVAILABLE_AT FETCH FIRST :n ROWS ONLY)          -- + SKIP LOCKED DATA
+          ORDER BY AVAILABLE_AT FETCH FIRST :n ROWS ONLY)
   SET STATUS = 'CLAIMED', OWNER = :me, CLAIM_TOKEN = CLAIM_TOKEN + 1, ATTEMPTS = ATTEMPTS + 1,
-      AVAILABLE_AT = CURRENT TIMESTAMP + :lease SECONDS, UPDATED_AT = CURRENT TIMESTAMP);
+      AVAILABLE_AT = CURRENT TIMESTAMP + :lease SECONDS, UPDATED_AT = CURRENT TIMESTAMP)
+SKIP LOCKED DATA
 -- B: same with STATUS = 'PENDING' for the remaining n − a rows
 ```
 
-Fallback if Db2 rejects this form: per selection, `SELECT ID ... ORDER BY AVAILABLE_AT
-FETCH FIRST :n ROWS ONLY WITH RS USE AND KEEP UPDATE LOCKS SKIP LOCKED DATA`, then
-`UPDATE ... WHERE ID IN (:ids)` and read back. If Db2 cannot combine ordering with skip
-locking in any form, ordering is dropped: the two selections still give recovery priority
-over PENDING rows, but `Q` in §7 (older expired claims ahead) is no longer defined, so C1
-and C2 are reported without a target. All statements
-share the operation's `T_tx`. `ConcurrentClaimIT` and `WorkItemRepositoryIT` decide.
+This is form A2 of the Phase 1 spike (`docs/claim-sql-spike.md`): `SKIP LOCKED DATA` ends the
+outer `SELECT`. Db2 12.1 rejects it at the end of the `UPDATE` inside `FINAL TABLE` or of
+the inner fullselect (SQLCODE -104). The lock-then-update fallback
+(`SELECT ... WITH RS USE AND KEEP UPDATE LOCKS SKIP LOCKED DATA`, then `UPDATE` by `ID`) is
+not stable: on a fresh table its `UPDATE` waited for the locked row until the lock timeout;
+after other ITs had used the table, it skipped it. A2 behaved correctly in every run.
+`ClaimSqlSpikeIT` fails unless A2 is accepted, skips locked rows, and takes the oldest rows
+first while another claim holds a lock; `WorkItemRepositoryIT` asserts the same for the
+repository's statement. The `Sweeper` uses the same form without `ORDER BY`. Both
+selections share the operation's `T_tx`.
 
 ## 7. Guarantees and time bounds
 
@@ -888,6 +921,7 @@ invariant.
 2. `WorkItemRepositoryIT` — per operation:
    - claim fields and predicate (`ATTEMPTS`, future `AVAILABLE_AT`);
    - claim order: expired CLAIMED rows before PENDING; PENDING by `AVAILABLE_AT`;
+   - claim skips rows locked by a concurrent claim without waiting, still oldest first;
    - reclaim after forced expiry with the next token;
    - renew returns exactly the matching CLAIMED pairs of this owner;
    - fenced writes with a stale token **or a different owner** update 0 rows;
@@ -910,6 +944,11 @@ invariant.
    - **after either race**, every further write by the old owner (renew, complete,
      retryOrFail) updates 0 rows.
    - Each race runs 200 times, released together by a barrier, plus the two fixed orders.
+
+Also in Phase 1: `ClaimSqlSpikeIT` records the candidate claim forms (§6) and fails unless
+A2 keeps its three properties; `WorkItemSchemaIT` covers the V1 constraints, including the
+`OPERATION_ID` format (including overlong ids ending in blanks, with and without an existing
+64-character id), exact-identity uniqueness and case sensitivity (§4, §5.4).
 
 **Phase 2 — runtime contracts**
 
@@ -1028,7 +1067,7 @@ only on that evidence.
 
 | Risk | Mitigation |
 |---|---|
-| `SKIP LOCKED DATA` placement, or ordering combined with it, differs from expectation | Phase 1 spike; fallback forms in §6; if ordering is impossible, C2 becomes a measured value. |
+| `SKIP LOCKED DATA` placement, or ordering combined with it, differs from expectation | Settled by the Phase 1 spike: form A2 combines both on Db2 12.1 (§6). `ClaimSqlSpikeIT` and `WorkItemRepositoryIT` fail if a Db2 upgrade changes that. |
 | `FINAL TABLE` over a searched UPDATE, or query-timeout close-socket mode, behaves unexpectedly | `WorkItemRepositoryIT` and `QueryTimeoutIT` in Phase 1. |
 | Simulating a lost commit acknowledgement reliably | A connection wrapper (commit, then throw) rather than network timing. |
 | The lease timing argument misses an interleaving | `LeaseSimulationTest` adds evidence over a finite grid of interleavings; `SustainedLoadIT` requires `claims.lost = 0`; `registration.late` exposes pauses the argument excludes. |
@@ -1099,3 +1138,14 @@ and load validation.
 | Sweeper batched with `SKIP LOCKED DATA`; T1 counts sweep transactions | Same issue for T1: one unbounded sweep could overrun `T_tx`. |
 | Effects: at most once per operation, exactly once when DONE, zero or one when FAILED; calls zero to `max-attempts` | Attempts can be exhausted without any call, so "at-least-once calls" and universal "exactly-once effects" were overstated. |
 | Simulation described as evidence supplementing the timing argument and real-driver tests | A finite grid cannot prove every execution. |
+
+**Revision 7 (Phase 1 code review):**
+
+| Change | Reason |
+|---|---|
+| `OPERATION_ID` restricted to `^[!-~]{1,64}$` (printable ASCII, no spaces), enforced by `CK_WORK_ITEM_OPERATION_ID` and the `IdempotencyKey` constructor | "Any content" did not fit the column: Db2 compares strings blank-padded, so `order-1` and `order-1 ` collided under the unique key, and `VARCHAR(64)` holds 64 bytes, not 64 characters (22 × `漢` is 66 bytes). |
+| Unique key on `(OPERATION_ID, LENGTH(OPERATION_ID))` | Db2 checks uniqueness before the `CHECK`, so a malformed id with trailing blanks still failed as a duplicate and would be dropped as "already enqueued". |
+| `OPERATION_ID VARCHAR(65)` with `CHECK (LENGTH BETWEEN 1 AND 64)` | Db2 silently cuts excess trailing blanks off on assignment: in `VARCHAR(64)`, 64 characters plus a blank were stored as a different 64-character id, or failed as a duplicate of it. |
+| Database collation precondition (`IDENTITY`); downstream compares keys exactly | Case-insensitive comparison would merge distinct ids. |
+| §6 claim SQL shows the spike's form A2; fallback paragraph replaced by the spike result | Db2 12.1 rejects the old primary form (SQLCODE -104); whether the fallback skips locked rows varies between runs. |
+| `ClaimSqlSpikeIT` asserts A2's acceptance, lock skipping and oldest-first order; the repository's lock-skip test also discriminates order | The spike stayed green as long as any form was accepted and skipped locks. |

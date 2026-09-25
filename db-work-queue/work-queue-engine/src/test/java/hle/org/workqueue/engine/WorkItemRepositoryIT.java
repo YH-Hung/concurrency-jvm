@@ -121,10 +121,15 @@ class WorkItemRepositoryIT {
 
     @Test
     void claimSkipsRowsLockedByAnotherClaimWithoutWaiting() throws Exception {
-        long older = rows.insert();
-        rows.setAvailableAt(older, -20);
+        // Inserted newest first, so ID order is the reverse of AVAILABLE_AT order.
+        long newest = rows.insert();
+        rows.setAvailableAt(newest, -10);
         long newer = rows.insert();
-        rows.setAvailableAt(newer, -10);
+        rows.setAvailableAt(newer, -20);
+        long older = rows.insert();
+        rows.setAvailableAt(older, -30);
+        long oldest = rows.insert();
+        rows.setAvailableAt(oldest, -40);
         CountDownLatch locked = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
 
@@ -142,9 +147,10 @@ class WorkItemRepositoryIT {
             Duration took = Duration.ofNanos(System.nanoTime() - start);
             release.countDown();
 
-            assertThat(heldByA.get(10, TimeUnit.SECONDS)).extracting(ClaimedItem::id).containsExactly(older);
-            assertThat(claimedByB).extracting(ClaimedItem::id).containsExactly(newer);
+            assertThat(heldByA.get(10, TimeUnit.SECONDS)).extracting(ClaimedItem::id).containsExactly(oldest);
+            assertThat(claimedByB).extracting(ClaimedItem::id).containsExactlyInAnyOrder(older, newer);
             assertThat(took).isLessThan(Db2TestSupport.IT_TIMEOUTS.lockWait());
+            assertThat(rows.row(newest).status()).isEqualTo("PENDING");
         }
     }
 

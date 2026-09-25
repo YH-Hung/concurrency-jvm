@@ -44,10 +44,10 @@ class ClaimSqlSpikeIT {
 
     private record Result(Candidate candidate, boolean accepted, boolean skipsLocked, boolean oldestFirst,
                           Duration secondClaimTook, String error) {
-        boolean usable() {
-            return accepted && skipsLocked;
-        }
     }
+
+    /** The form WorkItemRepository uses for claim and sweep (docs/claim-sql-spike.md). */
+    private static final String CHOSEN = "A2";
 
     private static final List<Candidate> CANDIDATES = List.of(
             new Candidate("A1", "single statement; SKIP LOCKED DATA ends the UPDATE inside FINAL TABLE", (c, n) -> ids(c, """
@@ -95,7 +95,10 @@ class ClaimSqlSpikeIT {
         System.out.println(report);
         Files.writeString(Path.of("target", "claim-sql-spike.md"), report);
 
-        assertThat(results).as("at least one claim form must be accepted and skip locked rows").anyMatch(Result::usable);
+        Result chosen = results.stream().filter(r -> r.candidate().id().equals(CHOSEN)).findFirst().orElseThrow();
+        assertThat(chosen.accepted()).as("%s is accepted by Db2: %s", CHOSEN, chosen.error()).isTrue();
+        assertThat(chosen.skipsLocked()).as("%s skips rows locked by another claim", CHOSEN).isTrue();
+        assertThat(chosen.oldestFirst()).as("%s takes the oldest rows first while another claim holds a lock", CHOSEN).isTrue();
     }
 
     private Result evaluate(Candidate candidate) throws SQLException {
