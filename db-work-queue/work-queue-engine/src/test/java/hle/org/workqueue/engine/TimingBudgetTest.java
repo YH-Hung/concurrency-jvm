@@ -100,17 +100,32 @@ class TimingBudgetTest {
 
     @Test
     void b4RejectsAProcessingTimeThatCutsOffASlowHealthyTask() {
-        // 30s + (3 + 1)·18s + 3·1s = 105s
+        // 1s + 30s + (3 + 1)·18s + 3·1s = 106s
         WorkQueueProperties properties = new WorkQueueProperties();
-        properties.setMaxProcessingTime(ofSeconds(104));
+        properties.setMaxProcessingTime(ofSeconds(105));
 
         assertThatThrownBy(() -> TimingBudget.check(properties, DEFAULT_POOL_SIZE))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("B4")
-                .hasMessageContaining("104s < 105s");
+                .hasMessageContaining("105s < 106s");
 
-        properties.setMaxProcessingTime(ofSeconds(105));
+        properties.setMaxProcessingTime(ofSeconds(106));
         TimingBudget.check(properties, DEFAULT_POOL_SIZE);
+    }
+
+    @Test
+    void b4CountsTheRegistrationAllowanceInTheItConfig() {
+        // 200ms + 3s + (2 + 1)·5.5s + 2·100ms = 19.9s
+        WorkQueueProperties properties = ItConfig.properties();
+        properties.setMaxProcessingTime(ofMillis(19_899));
+
+        assertThatThrownBy(() -> TimingBudget.check(properties, ItConfig.POOL_SIZE))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("B4")
+                .hasMessageContaining("19.899s < 19.9s");
+
+        properties.setMaxProcessingTime(ofMillis(19_900));
+        TimingBudget.check(properties, ItConfig.POOL_SIZE);
     }
 
     @Test

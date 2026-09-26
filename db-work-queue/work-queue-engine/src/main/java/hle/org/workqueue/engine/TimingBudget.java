@@ -45,11 +45,13 @@ public final class TimingBudget {
         if (poolSize < minPoolSize) {
             violations.add("B3: pool size >= concurrency + 4, but " + poolSize + " < " + minPoolSize);
         }
-        Duration slowHealthyTask = properties.getExternalCallTimeout()
+        // The deadline counts from the claim's return, and the task starts up to G later.
+        Duration slowHealthyTask = properties.getRegistrationAllowance()
+                .plus(properties.getExternalCallTimeout())
                 .plus(w.multipliedBy(properties.getCompletionRetries() + 1L))
                 .plus(properties.getCompletionRetryDelay().multipliedBy(properties.getCompletionRetries()));
         if (properties.getMaxProcessingTime().compareTo(slowHealthyTask) < 0) {
-            violations.add("B4: max-processing-time >= external-call-timeout + (completion-retries + 1)·W"
+            violations.add("B4: max-processing-time >= G + external-call-timeout + (completion-retries + 1)·W"
                     + " + completion-retries·completion-retry-delay, but "
                     + seconds(properties.getMaxProcessingTime()) + " < " + seconds(slowHealthyTask));
         }

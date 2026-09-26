@@ -39,7 +39,7 @@ class StaleCompletionIT {
         ClaimKey b = repository.claim("owner-b", 1).getFirst().key();
         assertThat(b.token()).isEqualTo(a.token() + 1);
 
-        assertThat(repository.renew("owner-a", List.of(a))).as("A's renewal reports the claim lost").isEmpty();
+        assertThat(repository.renew("owner-a", List.of(a)).lost()).as("A's renewal reports the claim lost").containsExactly(a);
         assertThat(repository.complete("owner-a", a, "result-a")).isEqualTo(FENCED);
         assertThat(repository.complete("owner-b", b, "result-b")).isEqualTo(DONE);
         assertThat(repository.complete("owner-a", a, "result-a")).as("still fenced after B completed").isEqualTo(FENCED);

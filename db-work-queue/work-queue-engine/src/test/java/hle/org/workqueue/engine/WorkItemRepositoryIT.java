@@ -11,7 +11,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -155,7 +154,7 @@ class WorkItemRepositoryIT {
     }
 
     @Test
-    void renewReturnsExactlyThisOwnersMatchingClaimedPairs() {
+    void renewRenewsExactlyThisOwnersMatchingClaimedPairs() {
         long r1 = rows.insert();
         rows.setAvailableAt(r1, -20);
         long r2 = rows.insert();
@@ -167,17 +166,44 @@ class WorkItemRepositoryIT {
         ClaimKey finished = repository.claim("owner-a", 1).getFirst().key();  // r3
         repository.complete("owner-a", finished, "result");
         rows.setAvailableAt(r1, 2);
+        ClaimKey staleToken = new ClaimKey(r1, mine.token() + 1);
 
-        Set<ClaimKey> renewed = repository.renew("owner-a",
-                List.of(mine, others, new ClaimKey(r1, mine.token() + 1), finished));
+        RenewalResult result = repository.renew("owner-a", List.of(mine, others, staleToken, finished));
 
-        assertThat(renewed).containsExactly(mine);
+        assertThat(result.renewed()).containsExactly(mine);
+        assertThat(result.ended()).containsExactly(finished);
+        assertThat(result.lost()).containsExactlyInAnyOrder(others, staleToken);
         assertThat(rows.availableIn(r1)).isGreaterThan(Duration.ofSeconds(20));
     }
 
     @Test
+    void renewReportsAClaimItsOwnerEndedAsEndedAndOneTakenFromItAsLost() {
+        long completed = rows.insert();
+        rows.setAvailableAt(completed, -40);
+        long retried = rows.insert();
+        rows.setAvailableAt(retried, -30);
+        long failed = rows.insert();
+        rows.setAvailableAt(failed, -20);
+        rows.setAttempts(failed, 4);
+        long revoked = rows.insert();
+        rows.setAvailableAt(revoked, -10);
+        Map<Long, ClaimKey> keys = repository.claim("owner-a", 4).stream()
+                .collect(toMap(ClaimedItem::id, ClaimedItem::key));
+        assertThat(repository.complete("owner-a", keys.get(completed), "result")).isEqualTo(DONE);
+        assertThat(repository.retryOrFail("owner-a", keys.get(retried), "boom")).isEqualTo(RETRY_SCHEDULED);
+        assertThat(repository.retryOrFail("owner-a", keys.get(failed), "boom")).isEqualTo(FAILED);
+        assertThat(repository.revokeOwner("owner-a", false)).isEqualTo(1);   // the only row still CLAIMED
+
+        RenewalResult result = repository.renew("owner-a", keys.values());
+
+        assertThat(result.renewed()).isEmpty();
+        assertThat(result.ended()).containsExactlyInAnyOrder(keys.get(completed), keys.get(retried), keys.get(failed));
+        assertThat(result.lost()).containsExactly(keys.get(revoked));
+    }
+
+    @Test
     void renewWithNoClaimsReturnsNothing() {
-        assertThat(repository.renew("owner-a", List.of())).isEmpty();
+        assertThat(repository.renew("owner-a", List.of())).isEqualTo(RenewalResult.NOTHING);
     }
 
     @Test
@@ -192,7 +218,7 @@ class WorkItemRepositoryIT {
             assertThat(claimed).hasSize(1);
             ClaimKey key = claimed.getFirst().key();
 
-            assertThat(repository.renew("owner-a", List.of(key))).containsExactly(key);
+            assertThat(repository.renew("owner-a", List.of(key)).renewed()).containsExactly(key);
 
             long expired = rows.insert();
             rows.setClaim(expired, "owner-dead", 5, 5, -1);
@@ -226,7 +252,7 @@ class WorkItemRepositoryIT {
 
         assertThat(repository.complete("owner-a", stale, "late")).isEqualTo(FENCED);
         assertThat(repository.retryOrFail("owner-a", stale, "late")).isEqualTo(FENCED);
-        assertThat(repository.renew("owner-a", List.of(stale))).isEmpty();
+        assertThat(repository.renew("owner-a", List.of(stale)).lost()).containsExactly(stale);
         assertThat(rows.row(id)).isEqualTo(before);
     }
 
@@ -238,7 +264,7 @@ class WorkItemRepositoryIT {
 
         assertThat(repository.complete("owner-b", key, "late")).isEqualTo(FENCED);
         assertThat(repository.retryOrFail("owner-b", key, "late")).isEqualTo(FENCED);
-        assertThat(repository.renew("owner-b", List.of(key))).isEmpty();
+        assertThat(repository.renew("owner-b", List.of(key)).lost()).containsExactly(key);
         assertThat(rows.row(id)).isEqualTo(before);
     }
 
@@ -405,7 +431,7 @@ class WorkItemRepositoryIT {
 
         assertThat(repository.sweep(10)).isEqualTo(1);
 
-        assertThat(repository.renew("owner-a", List.of(key))).isEmpty();
+        assertThat(repository.renew("owner-a", List.of(key)).lost()).containsExactly(key);
         assertThat(repository.retryOrFail("owner-a", key, "late")).isEqualTo(FENCED);
         assertThat(repository.complete("owner-a", key, "late")).isEqualTo(FENCED);
         WorkItems.Row row = rows.row(id);
@@ -515,7 +541,8 @@ class WorkItemRepositoryIT {
         assertThat(failed.owner()).isNull();
         assertThat(rows.row(othersRow)).isEqualTo(othersBefore);
 
-        assertThat(repository.renew("owner-a", keys.values())).isEmpty();
+        assertThat(repository.renew("owner-a", keys.values()).lost())
+                .containsExactlyInAnyOrderElementsOf(keys.values());
         assertThat(repository.complete("owner-a", keys.get(retryable), "late")).isEqualTo(FENCED);
         assertThat(repository.retryOrFail("owner-a", keys.get(exhausted), "late")).isEqualTo(FENCED);
     }

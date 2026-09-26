@@ -298,6 +298,22 @@ class ItemProcessorTest {
     }
 
     @Test
+    void aFailureWhoseMessageThrowsAnErrorIsStillRecordedByItsClassName() {
+        repository.thenReturn(PersistResult.RETRY_SCHEDULED);
+        IllegalStateException thrown = new IllegalStateException("downstream said no") {
+            @Override
+            public String getMessage() {
+                throw new AssertionError("sensitive-payload-from-accessor");
+            }
+        };
+
+        assertThat(process(throwing(thrown))).isEqualTo(Outcome.RETRY_SCHEDULED);
+
+        assertThat(repository.writes()).containsExactly(
+                new Write(RETRY_OR_FAIL, OWNER, CLAIM, thrown.getClass().getName()));
+    }
+
+    @Test
     void aCallThatFailsBecauseItsThreadWasInterruptedWritesNothing() {
         ExternalService wrapsTheInterrupt = (key, token, payload, timeout) -> {
             Thread.currentThread().interrupt();

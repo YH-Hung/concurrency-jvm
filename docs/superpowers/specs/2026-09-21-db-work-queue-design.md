@@ -1,6 +1,6 @@
 # db-work-queue — Design
 
-Date: 2026-09-21 (revision 10: 2026-09-26)
+Date: 2026-09-21 (revision 11: 2026-09-26)
 Status: Architecture accepted. Phase 1 gate passed (2026-09-25); approved for Phase 2.
 Production approval pending review of this revision. Every time value in §5.3 and §7 is a conditional target
 pending validation by the Phase 1 spike, review of the §5.3 timing argument,
@@ -261,17 +261,21 @@ backs off exponentially (cap `poll-backoff-max`).
    3. `try { register; thread.start(); } catch (Throwable t) { handle.finish(); ... }` —
       any failure between transfer and a successful start, including a registration error,
       is cleaned up by `finish()`, which releases the permit exactly once and is a no-op
-      on the registry if the handle was never registered.
+      on the registry if the handle was never registered. Nothing follows `thread.start()`
+      inside that `try`: once the thread runs, only its own body may finish the handle.
    4. Registration is `registry.putIfAbsent(key, handle)`. A collision is impossible (tokens
       are unique per claim), so it is treated as an invariant violation: the new handle is
       finished without starting, `workqueue.invariant.violations` is incremented, an ERROR
       is logged, and liveness reports DOWN.
-   5. The handle records the time between the claim operation returning and its
-      registration; more than `registration-allowance` increments
+   5. The handle records `claimedAt`, the time the claim operation returned. More than
+      `registration-allowance` between `claimedAt` and its registration increments
       `workqueue.registration.late` (the B2 proof assumes it does not happen, §5.3).
-4. **Run.** Body: `try { if (!handle.markRunning()) return; processor.process(...) } finally { handle.finish(); }`.
+      `claimedAt` is also where the handle's deadline, E3 and T2 (§7) count from.
+4. **Run.** Body: `try { if (!handle.markRunning()) return; processor.process(...) } catch (Throwable t) { log } finally { handle.finish(); }`.
    `markRunning()` fails if the handle was already cancelled, so a cancel that arrives
-   before execution skips processing but still runs `finish()`.
+   before execution skips processing but still runs `finish()`. The body catches every
+   `Throwable` and logs only the row id, token and the failure's diagnostics (§5.4); an
+   uncaught exception would reach the thread's default handler, which prints its message.
 5. **Finish (exactly once).** `finish()` does work only if `ended.compareAndSet(false, true)`:
    `registry.remove(key, this)` (value-aware — a handle can only remove itself, never a
    newer claim of the same row), then `permits.release()`, then metrics.
@@ -308,10 +312,15 @@ held = concurrency`.
 returned is still started) → wait up to `shutdown-grace` for the registry to empty, with
 renewal running → cancel all remaining handles → wait up to `shutdown-cancel-wait` → stop
 renewal, supervisor and sweeper → return. Nothing is released in Db2; leftover claims
-expire with their attempt consumed.
+expire with their attempt consumed. A stopped runner is not started again.
 
 **`crash()`** (package-private, tests only): stop all loops and cancel all handles at once,
 no drain and no waiting.
+
+**Cancelling a handle not yet registered.** The cancel step of stop and `crash()` first
+records its reason, then cancels every registered handle. The poll loop reads that reason
+after each registration and cancels the new handle before starting its thread, so a handle
+transferred but not yet registered when the cancel pass read the registry is cancelled too.
 
 ### 5.3 Timing budget
 
@@ -410,7 +419,7 @@ the constraint). Symbols: `I` = renew-interval, `d` = renew-retry-delay, `L` = l
 | B1 | `T_lock < T_tx` | a lock wait surfaces as a lock-timeout error | 3 < 5 | 1 < 2 |
 | B2 | `max(I, W) + 3W + d + G < L` | every claim, including a new one, survives one failed renewal round under the actual schedule | 74 < 100 | 22.4 < 30 |
 | B3 | `pool size ≥ concurrency + 4` | tasks, poll, renewal, sweeper and backlog sampler never wait for each other's connections | 20 ≥ 20 | 8 ≥ 8 |
-| B4 | `max-processing-time ≥ external-call-timeout + (completion-retries + 1)·W + completion-retries·completion-retry-delay` | a slow-but-healthy task is not cut off by its deadline | 120 ≥ 105 | 25 ≥ 19.7 |
+| B4 | `max-processing-time ≥ G + external-call-timeout + (completion-retries + 1)·W + completion-retries·completion-retry-delay` | a slow-but-healthy task is not cut off by its deadline, which counts from `claimedAt`, up to `G` before the task starts | 120 ≥ 106 | 25 ≥ 19.9 |
 | B5 | `db-staleness-limit > 1.5·idle-poll-interval + W` | a healthy idle instance never reports DB staleness | 90 > 19.5 | 10 > 5.65 |
 
 **Renewal round** is exactly one DB operation, however many claims are renewed:
@@ -424,7 +433,18 @@ SELECT ID, CLAIM_TOKEN FROM FINAL TABLE (
 )
 ```
 
-Lost claims = requested pairs − returned pairs.
+In the same transaction, the pairs the `UPDATE` did not return are read back:
+
+```sql
+SELECT ID, CLAIM_TOKEN FROM WORK_ITEM
+ WHERE STATUS <> 'CLAIMED' AND OWNER = :me
+   AND ((ID = ? AND CLAIM_TOKEN = ?) OR ...)   -- the pairs not renewed
+```
+
+A pair it returns is **ended**: this owner's own `complete` or `retryOrFail` ended it after
+the round took its snapshot. **Lost** claims = requested − renewed − ended: swept, revoked or
+re-claimed, each of which changes the row's token or owner (§5.1). Only lost claims are
+counted and cancelled.
 
 **Orchestrator setting (documented, not checkable):** termination grace period ≥
 `shutdown-grace + shutdown-cancel-wait + 10s`.
@@ -513,7 +533,10 @@ time, retention is permanent for the namespace.
   dedupe.
 - A downstream that cannot provide durable idempotency is **not supported**.
 - The engine never logs `PAYLOAD`, `RESULT_VALUE` or idempotency keys (may carry business
-  data); logs carry `ID`, `CLAIM_TOKEN`, owner and outcome only.
+  data); logs carry `ID`, `CLAIM_TOKEN`, owner and outcome only. A failure is logged by its
+  diagnostics — the class names down its cause chain, with SQL codes — never by its message
+  or the throwable itself: a message may carry business data, and a message or cause that
+  throws would throw out of the log call.
 
 ## 6. Engine components (`hle.org.workqueue.engine`)
 
@@ -522,7 +545,8 @@ time, retention is permanent for the namespace.
 | `WorkQueueProperties` | `@ConfigurationProperties("workqueue")`, including `db.*` timeouts. |
 | `TimingBudget`, `RenewalSchedule` | B1–B5 at startup; the renewal next-start function. |
 | `WorkItemRepository` | All SQL via `JdbcClient`, each operation in a timed `TransactionTemplate`: claim, renew, complete, retryOrFail, sweep, backlog sample, replay, revokeOwner, readNamespace. Only class that knows Db2 syntax. |
-| `ClaimedItem`, `ClaimKey`, `IdempotencyKey` | Records: `(id, operationId, payload, claimToken)`, `(id, token)`, `(namespace, operationId)` with validation (§5.4). |
+| `ClaimedItem`, `ClaimKey`, `IdempotencyKey`, `RenewalResult` | Records: `(id, operationId, payload, claimToken)`, `(id, token)`, `(namespace, operationId)` with validation (§5.4); `RenewalResult(renewed, ended, lost)`, the disjoint sets one renewal round reports (§5.3). |
+| `Diagnostics` | What the engine may log about a failure: the class names down its cause chain, with SQL codes, never a message (§5.4). |
 | `ClaimHandle` | One claim's lifecycle state (§5.2): permit ownership, `markRunning`, `cancel`, exactly-once `finish`. |
 | `QueueRunner` | Poll loop, renewal loop, supervisor, registry, permits, stop/crash. |
 | `ItemProcessor`, `Outcome` | One row, one call; persist the result with retries; returns `COMPLETED`, `RETRY_SCHEDULED`, `FAILED`, `FENCED`, `ABANDONED`, `INTERRUPTED`, `CANCELLED`. Never throws. |
@@ -580,6 +604,10 @@ time, retention is permanent for the namespace.
 | `admin.write-enabled` | false | true (AdminIT only) |
 
 The demo uses the production defaults, so its scenarios exercise the real budget.
+
+`QueueRunner` checks its own settings when it is constructed at startup: every interval,
+grace and allowance it uses is positive, and `concurrency`, `claim-batch-size` and
+`hung-task-limit` are at least 1.
 
 ### Claim SQL (settled by the Phase 1 spike)
 
@@ -665,11 +693,11 @@ under test.
 |---|---|---|---|---|
 | E1 | owner killed, frozen, or stopped renewing | its claims eligible within `L + W` of the moment the owner stops starting renewal rounds (a write already in flight can still land up to `W` later) | 118s | 35.5s |
 | E2 | SIGTERM | process exits within `shutdown-grace + shutdown-cancel-wait + 5s`; leftover claims eligible within `shutdown-grace + shutdown-cancel-wait + L + W` of SIGTERM | 30s / 143s | 8s / 38.5s |
-| E3 | task ignores interruption | its claim eligible within `M + W + L` of being claimed; counted hung within `M + hung-grace + supervisor-interval`; liveness DOWN within `hung-grace + supervisor-interval` of the `hung-task-limit`-th task being cancelled | 238s / 151s / 31s | 60.5s / 27.1s / 2.1s |
+| E3 | task ignores interruption | its claim eligible within `M + W + L` of its `claimedAt` (§5.2); counted hung within `M + hung-grace + 2·supervisor-interval` (the cancel and the hung mark each come at the supervisor's next pass); liveness DOWN within `hung-grace + supervisor-interval` of the `hung-task-limit`-th task being cancelled | 238s / 152s / 31s | 60.5s / 27.2s / 2.1s |
 | E4 | stale owner resumes | its lost claims cancelled within `max(I, W) + d + W` of resuming | 37s | 11.2s |
 | E5 | Db2 unreachable for D | **lease-preservation target** (§5.3): no claim is lost if `D ≤ max(d, L − max(I, W) − 4W − d − G)`. Not the longest survivable outage: a longer outage may let claims expire, be re-claimed and be called again, and durable downstream idempotency keeps the effects correct (`DbOutageIT`). After restoration, first successful claim within `poll-backoff-max + W` if the instance has a free permit. | 8s / 48s | 2.1s / 7.5s |
 | T1 | eligible and attempts exhausted | FAILED by the `Sweeper` within `E + sweep-interval + ⌈X / S⌉ · W`, where `X` is the number of rows eligible for sweeping; needs one live instance whose sweep transactions succeed | E + 30s + ⌈X/100⌉ · 18s | E + 1s + ⌈X/100⌉ · 5.5s |
-| T2 | claimed recovered row | if that attempt completes or fails finally, it does so within `C + M` | C + 120s | C + 25s |
+| T2 | claimed recovered row | if that attempt completes or fails finally, it does so within `C + M`, where `C` is that claim's `claimedAt` (§5.2) | C + 120s | C + 25s |
 
 **Measured recovery objectives**
 
@@ -784,7 +812,7 @@ changing replica count.
 | `call.duration{result=ok\|error\|timeout}` | timer | external calls |
 | `renewal.duration`, `renewal.errors` | timer, counter | renewal rounds that ran |
 | `renewal.lag` | gauge | max over renewal-eligible claims of the time since that claim's last successful lease write (claim or renewal); **0 when there are none** |
-| `claims.lost` | counter | claims reported lost by renewal |
+| `claims.lost` | counter | claims reported lost by renewal (§5.3); a claim its own task ended after the round's snapshot is not lost |
 | `db.last_success_age` | gauge | time since any engine DB operation succeeded; kept fresh on idle instances by the poll loop's empty claims, the sweeper and the backlog sampler |
 | `inflight`, `permits.available`, `tasks.hung` | gauges | local capacity |
 | `registration.late` | counter | handles registered more than `registration-allowance` after their claim returned (a process pause the B2 proof does not cover) |
@@ -891,9 +919,10 @@ bounds are asserted with the formulas of §7 evaluated on the test's config.
 
 ### 11.1 Unit and lifecycle-race tests (no Db2)
 
-`QueueRunner` takes an injectable repository, thread starter and clock, so races are
-driven deterministically with latches; every scenario ends by asserting the permit
-invariant.
+`QueueRunner` takes an injectable repository, processor, task-thread factory, clock and
+registry, so races are driven deterministically with latches; every scenario ends by
+asserting the permit invariant, counting every handle that received a permit, registered or
+not.
 
 - `ClaimHandleTest`: `finish()` exactly once under concurrent finish/cancel (10 000
   iterations released together by a barrier); value-aware removal; cancel never releases
@@ -918,7 +947,13 @@ invariant.
   - supervisor: deadline → cancel; `hung-grace` → hung gauge; `hung-task-limit` →
     liveness DOWN and the poll loop stops claiming;
   - `stop()`: no claims after stop begins, renewal continues while draining, cancel at
-    the grace deadline, nothing released.
+    the grace deadline, nothing released;
+  - `crash()` between a handle's transfer and its registration → that handle is cancelled
+    before its thread starts, and the processor is never invoked;
+  - renewal: a claim reported lost is counted and cancelled; one its own task ended after
+    the snapshot is neither;
+  - a task that throws, even an `Error` → logged by id, token and class name only,
+    `finish()` once.
 - `RenewalScheduleTest`: `next(s, e, ok)` for success, overrun and failure.
 - `TimingBudgetTest`: each of B1–B5 rejects a violating config and names itself;
   `I = 15s, W = 5s, d = 1s, G = 1s, L = 26s` is rejected by B2; `W = 18s` is rejected by
@@ -978,7 +1013,8 @@ invariant.
    - claim order: expired CLAIMED rows before PENDING; PENDING by `AVAILABLE_AT`;
    - claim skips rows locked by a concurrent claim without waiting, still oldest first;
    - reclaim after forced expiry with the next token;
-   - renew returns exactly the matching CLAIMED pairs of this owner;
+   - renew renews exactly the matching CLAIMED pairs of this owner, reports the pairs this
+     owner already completed or failed as ended, and the rest as lost;
    - fenced writes with a stale token **or a different owner** update 0 rows;
    - the persist read-back distinguishes "own write already committed" from "fenced";
    - sweep bumps the token and clears the owner; the swept owner's late renew, complete and
@@ -1246,3 +1282,17 @@ and load validation.
 | Leases kept at 100s / 30s, so E5 is 8s by default and 2.1s for ITs | Owner's decision; E1 stays 118s. |
 | `LeaseSimulation` lets a failed outage round fail as early as it can, at `W`, or aligned to the outage's last step, with a full-enumeration cross-check (§11.1) | A failed round takes up to `W`, and the model must cover the fast-failing retry chain. The round the outage begins in also needs the early failure: without it the reduced model found the first loss one step late near the B2 bound. |
 | §4 `OWNER` comment: current claim holder, NULL after revocation, sweep or replay | Sweep now clears `OWNER` (revision 8). |
+
+**Revision 11 (Phase 2c planning, `QueueRunner`):**
+
+| Change | Reason |
+|---|---|
+| B4 adds `G`: `max-processing-time ≥ G + external-call-timeout + (completion-retries + 1)·W + completion-retries·completion-retry-delay` (106 ≤ 120 by default, 19.9 ≤ 25 in ITs) | The deadline counts from `claimedAt`, but the task starts only after its registration, up to `G` later, so without `G` a slow-but-healthy task could be cut off. |
+| `claimedAt`, when the claim operation returned, is named as the origin of the deadline, E3 and T2 | "Being claimed" and `C` could mean the claim operation's start, its commit or its return. |
+| E3's hung target is `M + hung-grace + 2·supervisor-interval` (152s / 27.2s) | The supervisor cancels at its first pass after the deadline and marks the task hung at its first pass `hung-grace` after that; each pass can come up to one interval late. |
+| The renewal round reads back, in the same transaction, the pairs it did not renew; a pair this owner already ended is not lost | A task that persisted its outcome between a round's snapshot and its `UPDATE` was counted in `claims.lost` and cancelled, so `claims.lost = 0` in `SustainedLoadIT` could not hold. |
+| Nothing follows `thread.start()` in the `try` whose `catch` finishes the handle; the task body catches `Throwable` | A failure after the start would release the permit of a running task. An uncaught failure would reach the thread's default handler, which prints its message. |
+| The cancel step of stop and `crash()` also reaches a handle transferred but not yet registered | A handle registered just after the cancel pass read the registry would have run on uncancelled. |
+| Failures are logged by their diagnostics only (§5.4) | A message may carry business data, and a message or cause that throws would throw out of the log call. |
+| `QueueRunner` validates its intervals, graces and counts at startup | A zero `hung-grace` marked every cancelled task hung at once. |
+| §6 lists `RenewalResult` and `Diagnostics` | Both are engine components that revision 11 added (§5.3, §5.4), but the component table did not name them. |

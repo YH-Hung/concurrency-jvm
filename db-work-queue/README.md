@@ -2,7 +2,7 @@
 
 Db2-backed work-queue engine. Design: [spec](../docs/superpowers/specs/2026-09-21-db-work-queue-design.md).
 
-Status: Phase 1 gate green (spec §12: ITs 1–5); see [docs/claim-sql-spike.md](docs/claim-sql-spike.md). Phase 2 — runtime contracts — in progress: timing foundations (`TimingBudget`, `RenewalSchedule`, `LeaseSimulationTest`), `ClaimHandle` and `ItemProcessor` done; `QueueRunner` next.
+Status: Phase 1 gate green (spec §12: ITs 1–5); see [docs/claim-sql-spike.md](docs/claim-sql-spike.md). Phase 2 — runtime contracts — in progress: timing foundations (`TimingBudget`, `RenewalSchedule`, `LeaseSimulationTest`), `ClaimHandle`, `ItemProcessor` and `QueueRunner` done; the `Sweeper`, metrics and health next.
 
 ## Prerequisites
 

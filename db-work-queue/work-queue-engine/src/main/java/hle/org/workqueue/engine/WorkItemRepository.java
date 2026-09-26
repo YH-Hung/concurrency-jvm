@@ -16,6 +16,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -105,34 +106,39 @@ public class WorkItemRepository {
 
     /**
      * One renewal round (spec §5.3): pushes the lease of every listed claim that is still CLAIMED by
-     * {@code owner} with the same token, in one statement. A requested claim missing from the result is lost.
+     * {@code owner} with the same token, in one statement. In the same transaction, a claim it did not renew is
+     * reported ended if this owner's own complete or retryOrFail already ended it (the row still has this owner and
+     * token but is no longer CLAIMED), and lost otherwise.
      */
-    public Set<ClaimKey> renew(String owner, Collection<ClaimKey> claims) {
+    public RenewalResult renew(String owner, Collection<ClaimKey> claims) {
         requireOwner(owner);
-        if (claims.isEmpty()) {
-            return Set.of();
+        Set<ClaimKey> requested = Set.copyOf(claims);
+        if (requested.isEmpty()) {
+            return RenewalResult.NOTHING;
         }
-        Map<String, Object> params = new HashMap<>();
-        params.put("owner", owner);
-        params.put("leaseSeconds", leaseSeconds());
-        StringJoiner pairs = new StringJoiner(" OR ");
-        int i = 0;
-        for (ClaimKey claim : claims) {
-            pairs.add("(ID = :id" + i + " AND CLAIM_TOKEN = :token" + i + ")");
-            params.put("id" + i, claim.id());
-            params.put("token" + i, claim.token());
-            i++;
-        }
-        return inTransaction(jdbc -> jdbc.sql("""
-                SELECT ID, CLAIM_TOKEN FROM FINAL TABLE (
-                  UPDATE WORK_ITEM
-                     SET AVAILABLE_AT = CURRENT TIMESTAMP + (CAST(:leaseSeconds AS INTEGER)) SECONDS,
-                         UPDATED_AT = CURRENT TIMESTAMP
-                   WHERE STATUS = 'CLAIMED' AND OWNER = :owner AND (%s))
-                """.formatted(pairs))
-                .params(params)
-                .query((rs, rowNum) -> new ClaimKey(rs.getLong("ID"), rs.getLong("CLAIM_TOKEN")))
-                .set());
+        return inTransaction(jdbc -> {
+            Map<String, Object> params = new HashMap<>();
+            params.put("owner", owner);
+            params.put("leaseSeconds", leaseSeconds());
+            Set<ClaimKey> renewed = claimKeys(jdbc, """
+                    SELECT ID, CLAIM_TOKEN FROM FINAL TABLE (
+                      UPDATE WORK_ITEM
+                         SET AVAILABLE_AT = CURRENT TIMESTAMP + (CAST(:leaseSeconds AS INTEGER)) SECONDS,
+                             UPDATED_AT = CURRENT TIMESTAMP
+                       WHERE STATUS = 'CLAIMED' AND OWNER = :owner AND (%s))
+                    """, params, requested);
+            Set<ClaimKey> missing = new HashSet<>(requested);
+            missing.removeAll(renewed);
+            if (missing.isEmpty()) {
+                return new RenewalResult(renewed, Set.of(), Set.of());
+            }
+            Set<ClaimKey> ended = claimKeys(jdbc, """
+                    SELECT ID, CLAIM_TOKEN FROM WORK_ITEM
+                     WHERE STATUS <> 'CLAIMED' AND OWNER = :owner AND (%s)
+                    """, Map.of("owner", owner), missing);
+            missing.removeAll(ended);
+            return new RenewalResult(renewed, ended, missing);
+        });
     }
 
     /** Stores the result of this claim's call and marks the row DONE (fenced, with read-back). */
@@ -340,6 +346,24 @@ public class WorkItemRepository {
 
     private int leaseSeconds() {
         return Math.toIntExact(settings.lease().toSeconds());
+    }
+
+    // Runs sql, whose %s is replaced by one (ID, CLAIM_TOKEN) match per claim, and returns the pairs it selects.
+    private static Set<ClaimKey> claimKeys(JdbcClient jdbc, String sql, Map<String, Object> params,
+                                           Collection<ClaimKey> claims) {
+        Map<String, Object> allParams = new HashMap<>(params);
+        StringJoiner pairs = new StringJoiner(" OR ");
+        int i = 0;
+        for (ClaimKey claim : claims) {
+            pairs.add("(ID = :id" + i + " AND CLAIM_TOKEN = :token" + i + ")");
+            allParams.put("id" + i, claim.id());
+            allParams.put("token" + i, claim.token());
+            i++;
+        }
+        return jdbc.sql(sql.formatted(pairs))
+                .params(allParams)
+                .query((rs, rowNum) -> new ClaimKey(rs.getLong("ID"), rs.getLong("CLAIM_TOKEN")))
+                .set();
     }
 
     static void requireOwner(String owner) {

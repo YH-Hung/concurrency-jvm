@@ -3,7 +3,6 @@ package hle.org.workqueue.engine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.sql.SQLException;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.function.BooleanSupplier;
@@ -48,9 +47,6 @@ final class ItemProcessor {
 
     static final String NO_RESULT_ERROR = "the external service returned no result";
     static final String INVALID_OPERATION_ID_ERROR = "OPERATION_ID is not a valid operation identity; not called";
-
-    /** Bounds the logged cause chain, which may be cyclic. */
-    private static final int MAX_LOGGED_CAUSES = 8;
 
     private static final Logger log = LoggerFactory.getLogger(ItemProcessor.class);
 
@@ -112,11 +108,12 @@ final class ItemProcessor {
         return persist(item, () -> repository.retryOrFail(owner, item.key(), error));
     }
 
-    // Throwable.toString() calls getLocalizedMessage(), which a downstream exception may override and break.
+    // Throwable.toString() calls getLocalizedMessage(), which a downstream exception may override and break, even
+    // with an Error; the attempt must still be recorded as failed.
     private static String describe(Exception failure) {
         try {
             return failure.toString();
-        } catch (RuntimeException broken) {
+        } catch (Throwable broken) {
             return failure.getClass().getName();
         }
     }
@@ -145,41 +142,8 @@ final class ItemProcessor {
     // reads a message or cause that throws would throw out of process().
     private Outcome abandoned(ClaimedItem item, RuntimeException lastFailure) {
         log.warn("Abandoned row {} token {} of owner {}: its outcome could not be persisted: {}", item.id(),
-                item.claimToken(), owner, diagnostics(lastFailure));
+                item.claimToken(), owner, Diagnostics.describe(lastFailure));
         return Outcome.ABANDONED;
-    }
-
-    /** The class names down the failure's cause chain, with SQL codes: no messages, and nothing that can throw. */
-    private static String diagnostics(Throwable failure) {
-        StringBuilder text = new StringBuilder();
-        Throwable current = failure;
-        for (int depth = 0; current != null && depth < MAX_LOGGED_CAUSES; depth++) {
-            text.append(depth == 0 ? "" : ", caused by ").append(current.getClass().getName());
-            appendSqlCodes(text, current);
-            current = causeOf(current);
-        }
-        return text.toString();
-    }
-
-    private static Throwable causeOf(Throwable failure) {
-        try {
-            return failure.getCause();
-        } catch (RuntimeException unreadable) {
-            return null;
-        }
-    }
-
-    private static void appendSqlCodes(StringBuilder text, Throwable failure) {
-        if (!(failure instanceof SQLException sql)) {
-            return;
-        }
-        try {
-            String state = sql.getSQLState();
-            int code = sql.getErrorCode();
-            text.append(" (SQLState ").append(state).append(", error code ").append(code).append(')');
-        } catch (RuntimeException unreadable) {
-            // The class name alone is still a diagnostic.
-        }
     }
 
     private static Outcome outcomeOf(PersistResult result) {

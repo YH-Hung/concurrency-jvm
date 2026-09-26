@@ -73,7 +73,7 @@ class RevokeRaceIT {
 
         assertValidOutcome(write, claim, new Outcome(revoked, written, rows.row(claim.id())));
         if (write == Write.RENEW) {
-            assertThat(written).isEqualTo(Set.of(claim.key()));
+            assertThat(written).isEqualTo(new RenewalResult(Set.of(claim.key()), Set.of(), Set.of()));
         } else {
             assertThat(revoked).isZero();
         }
@@ -90,7 +90,8 @@ class RevokeRaceIT {
 
         assertValidOutcome(write, claim, new Outcome(revoked, written, rows.row(claim.id())));
         assertThat(revoked).isEqualTo(1);
-        assertThat(written).isEqualTo(write == Write.RENEW ? Set.of() : PersistResult.FENCED);
+        assertThat(written).isEqualTo(write == Write.RENEW
+                ? new RenewalResult(Set.of(), Set.of(), Set.of(claim.key())) : PersistResult.FENCED);
         assertOldOwnerIsFenced(claim);
     }
 
@@ -165,7 +166,9 @@ class RevokeRaceIT {
             }
             case RENEW -> {
                 assertThat(outcome.revoked()).isEqualTo(1);
-                assertThat(outcome.written()).isIn(Set.of(), Set.of(claim.key()));
+                RenewalResult renewal = (RenewalResult) outcome.written();
+                assertThat(renewal).isIn(new RenewalResult(Set.of(), Set.of(), Set.of(claim.key())),
+                        new RenewalResult(Set.of(claim.key()), Set.of(), Set.of()));
                 assertRevoked(claim, row);
             }
         }
@@ -186,7 +189,7 @@ class RevokeRaceIT {
     private void assertOldOwnerIsFenced(Claim claim) {
         WorkItems.Row before = rows.row(claim.id());
 
-        assertThat(repository.renew(claim.owner(), List.of(claim.key()))).isEmpty();
+        assertThat(repository.renew(claim.owner(), List.of(claim.key())).renewed()).isEmpty();
         repository.complete(claim.owner(), claim.key(), "late");
         repository.retryOrFail(claim.owner(), claim.key(), "late");
 
@@ -195,7 +198,7 @@ class RevokeRaceIT {
 
     private static String order(Write write, Outcome outcome) {
         if (write == Write.RENEW) {
-            return outcome.written().equals(Set.of()) ? "revoke first" : "renew first";
+            return ((RenewalResult) outcome.written()).renewed().isEmpty() ? "revoke first" : "renew first";
         }
         return outcome.revoked() == 1 ? "revoke first" : "owner write first";
     }
