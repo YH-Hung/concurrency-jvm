@@ -24,7 +24,7 @@ final class Db2TestSupport {
 
     /** IT column of spec §6 for the settings the repository uses. */
     static final WorkItemRepository.Settings IT_SETTINGS =
-            new WorkItemRepository.Settings(Duration.ofSeconds(25), 5, Duration.ofMillis(100));
+            new WorkItemRepository.Settings(Duration.ofSeconds(30), 5, Duration.ofMillis(100));
 
     private static final Db2Container DB2 = new Db2Container(DockerImageName.parse("icr.io/db2_community/db2:12.1.5.0"))
             .acceptLicense()

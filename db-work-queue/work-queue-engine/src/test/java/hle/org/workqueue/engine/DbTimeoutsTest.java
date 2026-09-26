@@ -46,6 +46,12 @@ class DbTimeoutsTest {
     }
 
     @Test
+    void worstCaseOperationIsPoolWaitPlusLoginPlusTransactionPlusRead() {
+        assertThat(DbTimeouts.defaults().worstCaseOperation()).isEqualTo(ofSeconds(18));
+        assertThat(IT.worstCaseOperation()).isEqualTo(ofMillis(5500));
+    }
+
+    @Test
     void exposesTheTransactionTimeoutInWholeSeconds() {
         assertThat(IT.transactionSeconds()).isEqualTo(2);
     }

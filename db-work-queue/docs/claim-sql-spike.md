@@ -72,17 +72,15 @@ Findings:
   the statement's own `DataAccessException` (and maps `CannotCreateTransactionException` /
   `TransactionTimedOutException` to `DataAccessResourceFailureException`), so every database failure surfaces as a
   `DataAccessException`. Spring still logs "Application exception overridden by rollback exception" at ERROR on this
-  path, which Phase 2 should decide how to handle.
+  path; spec revision 8 keeps it as expected and documents it (§8).
 - Latency on emulated Db2 (ConcurrentClaimIT, above) is far below the IT timeouts; no timeout was exceeded in any IT.
 
-Open questions for Phase 2:
+Open questions for Phase 2, resolved in spec revision 8:
 
-- Sweep keeps `OWNER` and `CLAIM_TOKEN` on the rows it fails. A late `retryOrFail` from the swept owner then reads back
-  `FAILED` as if it were its own write, and its error text is not stored. Decide in the Sweeper/ItemProcessor design
-  whether sweep should clear `OWNER`. Deferred by the project owner.
-- Db2 `CURRENT TIMESTAMP` is the server's local time, and every lease, backoff and expiry comparison uses it (spec
-  §5.1). If the Db2 server's time zone observes DST, all live leases expire at once at spring-forward and expiry is
-  delayed by up to an hour at fall-back. The spec does not state a time-zone precondition. Decide before V1 is
-  deployed: require the Db2 server to run in UTC (`CURRENT TIMEZONE = 0` at startup is necessary but not sufficient,
-  because zones such as Europe/London are at offset 0 in winter and still observe DST; the precondition must be
-  that the server's time zone is UTC), or make the arithmetic UTC-based.
+- Sweep kept `OWNER` and `CLAIM_TOKEN` on the rows it failed, so a late `retryOrFail` from the swept owner read back
+  `FAILED` as if it were its own write, and its error text was not stored. Sweep now bumps `CLAIM_TOKEN` and clears
+  `OWNER`, as `revokeOwner` does; the swept owner's late writes are fenced
+  (`WorkItemRepositoryIT.lateWritesBySweptOwnerAreFenced`).
+- Db2 `CURRENT TIMESTAMP` is the server's local time, and every lease, backoff and expiry comparison uses it. The Db2
+  instance must run in UTC (spec §5.1 precondition, runbook check); `SchemaCheck` will require
+  `CURRENT TIMEZONE = 0`, which is necessary but not sufficient (Europe/London is at offset 0 in winter).

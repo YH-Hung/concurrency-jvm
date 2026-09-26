@@ -187,8 +187,9 @@ public class WorkItemRepository {
 
     /**
      * One sweep batch (spec §6 Sweeper): up to {@code batchSize} expired CLAIMED rows with exhausted
-     * attempts become FAILED, skipping rows another transaction holds. Returns the number swept; the
-     * caller repeats while a batch comes back full.
+     * attempts become FAILED, skipping rows another transaction holds. Like revokeOwner, it bumps the token
+     * and clears the owner, so the swept owner's late writes are fenced instead of reading back FAILED as
+     * their own (spec §5.1). Returns the number swept; the caller repeats while a batch comes back full.
      */
     public int sweep(int batchSize) {
         if (batchSize < 1) {
@@ -196,13 +197,14 @@ public class WorkItemRepository {
         }
         return inTransaction(jdbc -> jdbc.sql(String.format(Locale.ROOT, """
                 SELECT ID FROM FINAL TABLE (
-                  UPDATE (SELECT ID, STATUS, LAST_ERROR, UPDATED_AT
+                  UPDATE (SELECT ID, STATUS, OWNER, CLAIM_TOKEN, LAST_ERROR, UPDATED_AT
                             FROM WORK_ITEM
                            WHERE STATUS = 'CLAIMED'
                              AND AVAILABLE_AT <= CURRENT TIMESTAMP
                              AND ATTEMPTS >= :maxAttempts
                            FETCH FIRST %d ROWS ONLY)
-                     SET STATUS = 'FAILED', LAST_ERROR = :error, UPDATED_AT = CURRENT TIMESTAMP)
+                     SET STATUS = 'FAILED', CLAIM_TOKEN = CLAIM_TOKEN + 1, OWNER = NULL,
+                         LAST_ERROR = :error, UPDATED_AT = CURRENT TIMESTAMP)
                 SKIP LOCKED DATA
                 """, batchSize))
                 .param("maxAttempts", settings.maxAttempts())

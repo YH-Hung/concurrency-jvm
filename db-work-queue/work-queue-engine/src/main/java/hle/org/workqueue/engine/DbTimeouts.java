@@ -40,6 +40,11 @@ public record DbTimeouts(Duration poolWait, Duration login, Duration transaction
                 Duration.ofSeconds(8), Duration.ofSeconds(3));
     }
 
+    /** W: the worst case for one DB operation, T_pool + T_login + T_tx + T_read (spec §5.3). */
+    public Duration worstCaseOperation() {
+        return poolWait.plus(login).plus(transaction).plus(read);
+    }
+
     /** T_tx as a Spring transaction timeout. */
     public int transactionSeconds() {
         return Math.toIntExact(transaction.toSeconds());

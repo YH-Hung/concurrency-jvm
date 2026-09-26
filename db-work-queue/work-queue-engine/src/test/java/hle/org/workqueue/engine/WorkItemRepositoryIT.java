@@ -63,7 +63,7 @@ class WorkItemRepositoryIT {
         assertThat(row.owner()).isEqualTo("owner-a");
         assertThat(row.claimToken()).isEqualTo(1);
         assertThat(row.attempts()).isEqualTo(1);
-        assertThat(rows.availableIn(id)).isBetween(Duration.ofSeconds(20), Duration.ofSeconds(25));
+        assertThat(rows.availableIn(id)).isBetween(Duration.ofSeconds(25), Duration.ofSeconds(30));
     }
 
     @Test
@@ -388,11 +388,30 @@ class WorkItemRepositoryIT {
             WorkItems.Row row = rows.row(id);
             assertThat(row.status()).isEqualTo("FAILED");
             assertThat(row.lastError()).isEqualTo(WorkItemRepository.SWEPT_ERROR);
-            assertThat(row.claimToken()).isEqualTo(5);
+            assertThat(row.claimToken()).isEqualTo(6);
+            assertThat(row.owner()).isNull();
             assertThat(row.attempts()).isEqualTo(5);
         });
         assertThat(rows.row(live).status()).isEqualTo("CLAIMED");
         assertThat(rows.row(retryable).status()).isEqualTo("CLAIMED");
+    }
+
+    @Test
+    void lateWritesBySweptOwnerAreFenced() {
+        long id = rows.insert();
+        rows.setAttempts(id, 4);
+        ClaimKey key = repository.claim("owner-a", 1).getFirst().key();
+        rows.forceExpiry(id);
+
+        assertThat(repository.sweep(10)).isEqualTo(1);
+
+        assertThat(repository.renew("owner-a", List.of(key))).isEmpty();
+        assertThat(repository.retryOrFail("owner-a", key, "late")).isEqualTo(FENCED);
+        assertThat(repository.complete("owner-a", key, "late")).isEqualTo(FENCED);
+        WorkItems.Row row = rows.row(id);
+        assertThat(row.status()).isEqualTo("FAILED");
+        assertThat(row.lastError()).isEqualTo(WorkItemRepository.SWEPT_ERROR);
+        assertThat(row.resultValue()).isNull();
     }
 
     @Test

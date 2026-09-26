@@ -1,8 +1,8 @@
 # db-work-queue — Design
 
-Date: 2026-09-21 (revision 7: 2026-09-25)
-Status: Architecture accepted. Approved for the Phase 1 Db2 spike. Production approval
-pending review of this revision. Every time value in §5.3 and §7 is a conditional target
+Date: 2026-09-21 (revision 10: 2026-09-26)
+Status: Architecture accepted. Phase 1 gate passed (2026-09-25); approved for Phase 2.
+Production approval pending review of this revision. Every time value in §5.3 and §7 is a conditional target
 pending validation by the Phase 1 spike, review of the §5.3 timing argument,
 `LeaseSimulationTest`, and the real-driver and load tests.
 
@@ -97,8 +97,8 @@ WORK_ITEM
   STATUS        VARCHAR(10)   NOT NULL DEFAULT 'PENDING'
                               CHECK (STATUS IN ('PENDING','CLAIMED','DONE','FAILED'))
   AVAILABLE_AT  TIMESTAMP     NOT NULL DEFAULT CURRENT TIMESTAMP
-  OWNER         VARCHAR(64)                        -- current/last claiming instance
-  CLAIM_TOKEN   BIGINT        NOT NULL DEFAULT 0   -- fencing token; +1 per claim or revocation; never reset
+  OWNER         VARCHAR(64)                        -- current claim holder; NULL after revocation, sweep or replay
+  CLAIM_TOKEN   BIGINT        NOT NULL DEFAULT 0   -- fencing token; +1 per claim, revocation or sweep; never reset
   ATTEMPTS      INT           NOT NULL DEFAULT 0   -- claims since last (re)queue; reset only by replay
   RESULT_VALUE  VARCHAR(1000)
   LAST_ERROR    VARCHAR(1000)
@@ -189,7 +189,7 @@ served oldest-available first. Both selections use `IX_WORK_ITEM_CLAIM`.
     │  │  └─ retryOrFail, ATTEMPTS < max ┘  │  ├─ retryOrFail, ATTEMPTS ≥ max ──▶ FAILED
     │  │     (AVAILABLE_AT = now + backoff) │  │                                    │
     │  │                                    │  └─ renewal stops, lease expires ─▶ claimable again
-    │  │                                    │     (ATTEMPTS ≥ max ─▶ Sweeper ─▶ FAILED)
+    │  │                                    │     (ATTEMPTS ≥ max ─▶ Sweeper ─▶ FAILED, CLAIM_TOKEN+1, OWNER = NULL)
     │  └─ admin revokeOwner, ATTEMPTS < max ┘     (ATTEMPTS ≥ max ─▶ FAILED)      │
     │     (CLAIM_TOKEN+1, OWNER = NULL, AVAILABLE_AT = now)                       │
     └──────────── admin replay (ATTEMPTS = 0, AVAILABLE_AT = now; token unchanged) ◀┘
@@ -199,11 +199,24 @@ Rules:
 
 - **DB clock only.** Every timestamp written to or compared in Db2 is `CURRENT TIMESTAMP`.
   JVM clocks are used only for local deadlines (`System.nanoTime()`).
+- **Db2 runs in UTC (deployment precondition).** `CURRENT TIMESTAMP` is the Db2 server's
+  local time. In a time zone with daylight saving, every live lease would expire at once at
+  spring-forward, and expiry, backoff and sweeping would be delayed by up to an hour at
+  fall-back. `SchemaCheck` fails startup when `CURRENT TIMEZONE <> 0`; that check is
+  necessary but not sufficient (Europe/London is at offset 0 in winter), so the runbook
+  requires the Db2 instance's time zone to be UTC. UTC arithmetic in SQL was rejected: it
+  would change every statement and the `DEFAULT CURRENT TIMESTAMP` the upstream insert
+  contract relies on.
 - **Fenced writes.** Every write by a claim holder (renew, complete, retryOrFail) matches
   `ID = ? AND CLAIM_TOKEN = ? AND OWNER = :me AND STATUS = 'CLAIMED'`. Zero rows means
   the claim is no longer this instance's; the write is dropped. `OWNER` is included so
   that a repeated `(ID, CLAIM_TOKEN)` pair after a restore (§9.7) cannot match another
   process's claim: instance ids are unique per process start.
+- **Ending someone else's claim fences it.** The two statements that end a claim other
+  than by its holder's own write, the `Sweeper` and `revokeOwner` (§9.7), both set
+  `CLAIM_TOKEN = CLAIM_TOKEN + 1, OWNER = NULL`. The holder's late writes then update 0
+  rows, and the persist read-back (§6 `ItemProcessor`) reports `FENCED` instead of
+  mistaking the new state for its own committed write.
 - **Attempts are never refunded** except by explicit operator replay.
 - **One external call per claim.** A retry always goes through a new claim.
 - **One connection per thread.** No thread holds more than one pooled connection at a
@@ -318,7 +331,7 @@ or rollback round trip that the query timeout does not cover.
 | T_lock | `SET CURRENT LOCK TIMEOUT` (Hikari `connection-init-sql`) | 3s | 1s | a row-lock wait |
 
 **Worst case for one DB operation:** `W = T_pool + T_login + T_tx + T_read` = 18s default,
-5.5s in ITs. The defaults are deliberately tolerant, with a 90s lease to match: claim,
+5.5s in ITs. The defaults are deliberately tolerant, with a 100s lease to match: claim,
 renewal and sweep operations touch batches of rows and can wait on contention, so unloaded
 statement latency is no evidence for tighter values. They are tightened only after the
 Phase 1 spike and the load tests measure these operations under contention, and any
@@ -353,6 +366,32 @@ So every claim survives one completely failed renewal round iff
 `max(I, W) + 3W + d + G < L`. Example: `I = 15s, W = 5s, d = 1s, G = 1s, L = 26s` gives
 `15 + 15 + 1 + 1 = 32`, not `< 26`, and is rejected.
 
+**Why E5 has that form.** An outage fails every round it overlaps, including a round it
+begins in just before that round's commit (the acknowledgement is lost), and a failed
+round takes up to `W`: a refused connection fails at once, a stalled one only after `W`.
+A new claim's lease lasts until at least `c + L`; it is registered by `c + W + G`, and the
+first round that includes it starts by `s1 = c + W + G + max(I, W)`. An outage of length
+`D` that begins as that round ends fails it. Retries that fail at once keep the retry
+chain going to the end of the outage, so the last round it fails can start just before
+the outage ends, at `s1 + W + D`, and still take `W` to fail. The retry starts `d` later
+and writes within `W`. So the write lands by `c + max(I, W) + 4W + G + D + d`, and no claim
+is lost if that is before `c + L`. An outage no longer than `d` fails at most one round,
+because the retry starts `d` after a failure that came after the outage began; B2 covers
+that case.
+
+`E5 = max(d, L − max(I, W) − 4W − d − G)` (0 when B2 does not hold)
+
+The bound needs the retry chain to reach the outage's last step, which an outage shorter
+than `2d` does not allow; so when `d < E5 < 2d` the target is conservative (no claim is
+lost up to `2d`).
+
+With the defaults, `E5 = 100 − 18 − 72 − 1 − 1 = 8s`, and an 8.02s outage loses a claim: the
+claim writes its lease at 0 (it expires at 100s) and registers at 19s; round R0 takes
+19–37s, and R1 starts at 37s. The outage begins at 54.99s, so R1 fails at 55s. The retries
+at 56–62s fail at once, the retry at 63s fails at 81s, and the retry at 82s writes at 100s.
+`W` dominates E5: it counts five times (four when `I > W`), so each second cut from `W`
+(when `W ≥ I`) adds 5s to E5, while each second added to `L` adds one.
+
 `G` covers only the in-memory work between the claim returning and `putIfAbsent`; a
 process pause longer than `G` is a freeze (E4), detected by `workqueue.registration.late`.
 This timing argument is the primary justification for B2 and E5. `LeaseSimulationTest`
@@ -369,7 +408,7 @@ the constraint). Symbols: `I` = renew-interval, `d` = renew-retry-delay, `L` = l
 | ID | Constraint | Why | Default | IT |
 |---|---|---|---|---|
 | B1 | `T_lock < T_tx` | a lock wait surfaces as a lock-timeout error | 3 < 5 | 1 < 2 |
-| B2 | `max(I, W) + 3W + d + G < L` | every claim, including a new one, survives one failed renewal round under the actual schedule | 74 < 90 | 22.4 < 25 |
+| B2 | `max(I, W) + 3W + d + G < L` | every claim, including a new one, survives one failed renewal round under the actual schedule | 74 < 100 | 22.4 < 30 |
 | B3 | `pool size ≥ concurrency + 4` | tasks, poll, renewal, sweeper and backlog sampler never wait for each other's connections | 20 ≥ 20 | 8 ≥ 8 |
 | B4 | `max-processing-time ≥ external-call-timeout + (completion-retries + 1)·W + completion-retries·completion-retry-delay` | a slow-but-healthy task is not cut off by its deadline | 120 ≥ 105 | 25 ≥ 19.7 |
 | B5 | `db-staleness-limit > 1.5·idle-poll-interval + W` | a healthy idle instance never reports DB staleness | 90 > 19.5 | 10 > 5.65 |
@@ -488,10 +527,10 @@ time, retention is permanent for the namespace.
 | `QueueRunner` | Poll loop, renewal loop, supervisor, registry, permits, stop/crash. |
 | `ItemProcessor`, `Outcome` | One row, one call; persist the result with retries; returns `COMPLETED`, `RETRY_SCHEDULED`, `FAILED`, `FENCED`, `ABANDONED`, `INTERRUPTED`, `CANCELLED`. Never throws. |
 | `ExternalService`, `CallResult` | SPI (§5.4). |
-| `Sweeper` | Every `sweep-interval`: expired CLAIMED rows with `ATTEMPTS ≥ max` → FAILED, in batches of `sweep-batch-size` (`FETCH FIRST :s ROWS ONLY`, `SKIP LOCKED DATA`), repeating while a batch is full. Idempotent; runs on every instance; concurrent sweepers skip each other's rows instead of waiting. |
+| `Sweeper` | Every `sweep-interval`: expired CLAIMED rows with `ATTEMPTS ≥ max` → FAILED with `CLAIM_TOKEN + 1` and `OWNER = NULL` (§5.1), in batches of `sweep-batch-size` (`FETCH FIRST :s ROWS ONLY`, `SKIP LOCKED DATA`), repeating while a batch is full. Idempotent; runs on every instance; concurrent sweepers skip each other's rows instead of waiting. |
 | `BacklogSampler` | Every `backlog-sample-interval`: one query for DB-wide gauges (§9.6). |
 | `WorkQueueHealth` | Liveness and readiness contributors (§9.6). |
-| `SchemaCheck` | At startup: engine migration applied; `WORK_QUEUE_META.NAMESPACE` matches the §5.4 format and equals `workqueue.expected-namespace`. Fails fast otherwise. Workers never run DDL. |
+| `SchemaCheck` | At startup: engine migration applied; `WORK_QUEUE_META.NAMESPACE` matches the §5.4 format and equals `workqueue.expected-namespace`; `CURRENT TIMEZONE = 0` (§5.1). Fails fast otherwise. Workers never run DDL. |
 | `WorkQueueAdmin`, `WorkQueueEndpoint` | Replay and revokeOwner (§9.7); actuator endpoint `workqueue` with read (status) and write operations. Write operations are disabled unless `workqueue.admin.write-enabled=true`. |
 | `WorkQueueAutoConfiguration` | Wires the above; fails startup if no `ExternalService` bean exists. |
 
@@ -507,7 +546,8 @@ time, retention is permanent for the namespace.
    - 1 row → `COMPLETED` / `RETRY_SCHEDULED` / `FAILED`.
    - 0 rows and the read-back shows this owner's token already in the target state → an
      earlier attempt whose acknowledgement was lost did commit → the corresponding
-     success outcome, not `FENCED`.
+     success outcome, not `FENCED`. A sweep or revocation changes the token and owner, so
+     it never reads back as this owner's write.
    - 0 rows otherwise → `FENCED`.
    - A SQL error is retried up to `completion-retries` times, `completion-retry-delay`
      apart. Still failing, or interrupted while retrying → `ABANDONED` (the handle ends,
@@ -520,7 +560,7 @@ time, retention is permanent for the namespace.
 | `expected-namespace` | required, no default | `it` |
 | `concurrency` | 16 | 4 |
 | `claim-batch-size` | 20 | 20 |
-| `lease-duration` | 90s | 25s |
+| `lease-duration` | 100s | 30s |
 | `renew-interval` / `renew-retry-delay` | 15s / 1s | 1s / 200ms |
 | `registration-allowance` (G) | 1s | 200ms |
 | `idle-poll-interval` | 1s (± 50% jitter) | 100ms |
@@ -575,7 +615,8 @@ selections share the operation's `T_tx`.
 
 1. **Fenced final writes (strict).** Only the current claim of a CLAIMED row — matching
    `ID`, `CLAIM_TOKEN` and `OWNER` — can renew, complete or fail it. Revocation (§9.7)
-   ends a claim immediately.
+   ends a claim immediately; a sweep ends an expired, exhausted claim the same way
+   (token + 1, no owner).
 2. **Bounded attempts (strict).** Between two replays a row is claimed at most
    `max-attempts` times, with at most one external call per claim.
 3. **Bounded claim duration (strict).** No claim is renewed past `max-processing-time`.
@@ -622,11 +663,11 @@ under test.
 
 | ID | Event | Target | Default | IT |
 |---|---|---|---|---|
-| E1 | owner killed, frozen, or stopped renewing | its claims eligible within `L + W` of the moment the owner stops starting renewal rounds (a write already in flight can still land up to `W` later) | 108s | 30.5s |
-| E2 | SIGTERM | process exits within `shutdown-grace + shutdown-cancel-wait + 5s`; leftover claims eligible within `shutdown-grace + shutdown-cancel-wait + L + W` of SIGTERM | 30s / 133s | 8s / 33.5s |
-| E3 | task ignores interruption | its claim eligible within `M + W + L` of being claimed; counted hung within `M + hung-grace + supervisor-interval`; liveness DOWN within `hung-grace + supervisor-interval` of the `hung-task-limit`-th task being cancelled | 228s / 151s / 31s | 55.5s / 27.1s / 2.1s |
+| E1 | owner killed, frozen, or stopped renewing | its claims eligible within `L + W` of the moment the owner stops starting renewal rounds (a write already in flight can still land up to `W` later) | 118s | 35.5s |
+| E2 | SIGTERM | process exits within `shutdown-grace + shutdown-cancel-wait + 5s`; leftover claims eligible within `shutdown-grace + shutdown-cancel-wait + L + W` of SIGTERM | 30s / 143s | 8s / 38.5s |
+| E3 | task ignores interruption | its claim eligible within `M + W + L` of being claimed; counted hung within `M + hung-grace + supervisor-interval`; liveness DOWN within `hung-grace + supervisor-interval` of the `hung-task-limit`-th task being cancelled | 238s / 151s / 31s | 60.5s / 27.1s / 2.1s |
 | E4 | stale owner resumes | its lost claims cancelled within `max(I, W) + d + W` of resuming | 37s | 11.2s |
-| E5 | Db2 unreachable for D | **lease-preservation target** (§5.3): no claim is lost if `D < L − max(I, W) − 3W − d − G`. Not the longest survivable outage: a longer outage may let claims expire, be re-claimed and be called again, and durable downstream idempotency keeps the effects correct (`DbOutageIT`). After restoration, first successful claim within `poll-backoff-max + W` if the instance has a free permit. | 16s / 48s | 2.6s / 7.5s |
+| E5 | Db2 unreachable for D | **lease-preservation target** (§5.3): no claim is lost if `D ≤ max(d, L − max(I, W) − 4W − d − G)`. Not the longest survivable outage: a longer outage may let claims expire, be re-claimed and be called again, and durable downstream idempotency keeps the effects correct (`DbOutageIT`). After restoration, first successful claim within `poll-backoff-max + W` if the instance has a free permit. | 8s / 48s | 2.1s / 7.5s |
 | T1 | eligible and attempts exhausted | FAILED by the `Sweeper` within `E + sweep-interval + ⌈X / S⌉ · W`, where `X` is the number of rows eligible for sweeping; needs one live instance whose sweep transactions succeed | E + 30s + ⌈X/100⌉ · 18s | E + 1s + ⌈X/100⌉ · 5.5s |
 | T2 | claimed recovered row | if that attempt completes or fails finally, it does so within `C + M` | C + 120s | C + 25s |
 
@@ -674,7 +715,7 @@ timeouts (§11.3, §11.4).
 | **Task ignores interruption / hangs** | Deadline cancel stops renewal (E3); the hung thread keeps its permit; liveness DOWN at the limit → restart. | Deduped. |
 | **Transient processing failure** | `retryOrFail`: retry after `retry-backoff`, or FAILED at `max-attempts`. | Failure before the effect: nothing applied. Response lost after the effect: the retry returns the stored result. |
 | **Poison row** | Each claim consumes an attempt; FAILED at `max-attempts` by `retryOrFail` or the `Sweeper` (T1). | ≤ `max-attempts` calls. |
-| **Db2 unreachable / network stalled** | Every operation fails within W. Poll backs off. Claims are kept for outages below the E5 target; longer outages may let claims expire and be re-claimed after restoration. Idle instances report readiness DOWN after `db-staleness-limit`. | Repeated calls after a long outage are deduped. |
+| **Db2 unreachable / network stalled** | Every operation fails within W. Poll backs off. Claims are kept for outages below the E5 target; longer outages may let claims expire and be re-claimed after restoration. Idle instances report readiness DOWN after `db-staleness-limit`. A statement cut off by the close-socket query timeout also makes Spring log "Application exception overridden by rollback exception" at ERROR, because the rollback fails on the closed connection; this is expected and kept (a timed-out operation deserves an ERROR), and the runbook says so. | Repeated calls after a long outage are deduped. |
 | **Simultaneous claims** | `SKIP LOCKED DATA`; no overlap (`ConcurrentClaimIT`). | — |
 | **Operator revokes an owner** | Its CLAIMED rows get a new token and leave CLAIMED in one statement; the owner's next write is fenced and its next renewal reports them lost. | Its in-flight calls are deduped. |
 | **Db2 restored from backup** | Procedure in §9.7: quiesce, restore, restart. Restored rows keep their `OPERATION_ID` and are processed again. | Deduped (retention precondition, §5.4). Rows lost by the restore are re-enqueued by the producer with their original `OPERATION_ID`. |
@@ -799,6 +840,8 @@ changing replica count.
   by the producer with their original `OPERATION_ID`s. Never regenerate or reassign
   `OPERATION_ID`s during restore, migration or copy. Quiescing first, together with
   `OWNER` in fenced writes, keeps pre-restore processes from touching restored rows.
+- **Db2 time zone:** the Db2 instance must run in UTC (§5.1). Check it before the first
+  deployment and after any change to the Db2 host or instance configuration.
 - **Copy data to another environment:** set that environment's own
   `WORK_QUEUE_META.NAMESPACE` before starting its workers; they refuse to start otherwise.
 - Procedures for: backlog stalled, expired claims, hung tasks, Db2 outage, poison rows
@@ -879,7 +922,8 @@ invariant.
 - `RenewalScheduleTest`: `next(s, e, ok)` for success, overrun and failure.
 - `TimingBudgetTest`: each of B1–B5 rejects a violating config and names itself;
   `I = 15s, W = 5s, d = 1s, G = 1s, L = 26s` is rejected by B2; `W = 18s` is rejected by
-  B2 with a 60s lease and accepted with the default 90s lease; the IT config passes.
+  B2 with a 60s lease and accepted with the default 100s lease; the IT config passes;
+  E5 is 1s (= d) with a 90s lease and 8s with the default lease.
 - `LeaseSimulationTest` — **evidence for B2 and E5**, supplementing the §5.3 argument
   (a finite grid, not a proof of every execution). A discrete-event model (10ms steps) of
   one instance's lease timeline using the production `RenewalSchedule.next`:
@@ -888,14 +932,25 @@ invariant.
     `[ack, ack + G]`;
   - renewal rounds with durations in `[0, W]`, snapshot at round start, lease-setting
     write anywhere within a successful round;
+  - an outage fails every round it overlaps, including one it begins in just before the
+    round ends, and a failed round takes any time from 0 to `W`;
+  - the model reduces a failed outage round's duration to the earliest it can fail (0, or
+    the outage's start for the round the outage begins in), `W`, or the duration that
+    makes the next round start on the outage's last step, and a cross-check test compares
+    this with every duration on small configurations;
   - every claim phase relative to the renewal schedule, with every combination of the
     extreme durations above.
 
   Properties, over a grid of `(I, W, d, G, L)` plus the default and IT configs:
   - every config accepted by B2 keeps every claim's lease unexpired when exactly one
     renewal round fails, at every position;
-  - for every accepted config, an outage (rounds overlapping it fail and take `W`) shorter
-    than the E5 target, starting at every offset, loses no claim;
+  - for every accepted config, an outage no longer than the E5 target, starting at every
+    offset, loses no claim;
+  - both targets are tight: a config B2 rejects loses a claim to one failed round, and an
+    outage two steps (20ms) longer than E5 loses a claim on every tested configuration.
+    At the defaults and IT the first loss is at E5 + 20ms (E5 is conservative by 10ms), and
+    where E5 = d it can be at E5 + 10ms. E5 is not tight when `d < E5 < 2d` (§5.3), and
+    none of the configurations these checks use lies in that band;
   - maintained claims (not just new ones) satisfy both properties.
 - `IdempotencyKeyTest`: `("a:b", "c")` is rejected (namespace contains `:`);
   `("a", "b:c")` is accepted; namespaces outside `^[a-z0-9][a-z0-9-]{0,31}$` and empty or
@@ -926,7 +981,9 @@ invariant.
    - renew returns exactly the matching CLAIMED pairs of this owner;
    - fenced writes with a stale token **or a different owner** update 0 rows;
    - the persist read-back distinguishes "own write already committed" from "fenced";
-   - sweep; replay resets `ATTEMPTS` and keeps `CLAIM_TOKEN` and `OPERATION_ID`;
+   - sweep bumps the token and clears the owner; the swept owner's late renew, complete and
+     retryOrFail are fenced;
+   - replay resets `ATTEMPTS` and keeps `CLAIM_TOKEN` and `OPERATION_ID`;
    - revokeOwner bumps the token, clears the owner, and sets PENDING or FAILED by `ATTEMPTS`.
 3. `StaleCompletionIT` — A claims, expiry forced, B claims; A's renew reports lost, A's
    complete is fenced, B's result is stored.
@@ -951,6 +1008,18 @@ A2 keeps its three properties; `WorkItemSchemaIT` covers the V1 constraints, inc
 64-character id), exact-identity uniqueness and case sensitivity (§4, §5.4).
 
 **Phase 2 — runtime contracts**
+
+Phase 2 runs before the demo module exists (Phase 3). Its ITs use a test-scope
+`RecordingDownstream` in `work-queue-engine`: an in-memory `ExternalService` keyed by
+`key.value()` with the §10 semantics (the first result is stored and returned to every
+repeat; injectable fail-before-effect, fail-after-effect, blocking and
+interrupt-ignoring behaviour) and a call log with the `EXECUTION_LOG` outcomes of §4.
+Where ITs 6–12 name `EXECUTION_LOG`, `REPLAYED` or `INTERRUPTED`, they assert on that call
+log. The demo's durable simulated downstream (§10) arrives in Phase 3, and the
+process-level tests use it.
+Toxiproxy (ITs 6 and 12) proxies to the Db2 container's host-mapped port instead of
+joining a Testcontainers `Network`, so that the reused Db2 container is not recreated; a
+short spike at the start of the Phase 2 ITs confirms this works under Rosetta emulation.
 
 6. `ClaimFailureIT`:
    - ordinary failure: the claim statement fails (Toxiproxy reset) → permits returned,
@@ -983,7 +1052,7 @@ A2 keeps its three properties; `WorkItemSchemaIT` covers the V1 constraints, inc
     permit still held; liveness DOWN at the limit.
 12. `DbOutageIT` (Toxiproxy):
     - stall: every operation fails within W + 1s;
-    - short outage (1.5s, below the IT E5 target of 2.6s): no claims lost;
+    - short outage (1.5s, below the IT E5 target of 2.1s): no claims lost;
     - long outage (> lease): claims expire and are re-claimed after restoration; first
       claim within E5; repeated calls are `REPLAYED`; no operation has more than one
       effect, and each DONE operation has exactly one;
@@ -1039,9 +1108,9 @@ the Testcontainers Db2.
     for rows that needed retries (T3); FAILED operations with and without an applied
     effect.
 - `LoadWithFaultsIT` — the same load plus a kill -9 and restart of one worker every
-  5 min and one 20s Toxiproxy outage. Kills are spaced so the previous recovery has
+  5 min and one 25s Toxiproxy outage. Kills are spaced so the previous recovery has
   finished (Q = 0, N = r ≤ 16), K = 3 × 16, b = 20, and the downstream honours timeouts,
-  so each kill must meet E1 and the C2 target. The 20s outage exceeds the 16s E5 target:
+  so each kill must meet E1 and the C2 target. The 25s outage exceeds the 8s E5 target:
   claims may be re-claimed, and the test asserts at most one effect per operation, exactly
   one per DONE operation, and first claim within E5's restoration bound. Time-to-claim and time-to-terminal are reported. Invariants hold at
   the end.
@@ -1052,8 +1121,8 @@ Load results on emulated Db2 are a regression baseline, not a production capacit
 
 | Phase | Scope | Gate |
 |---|---|---|
-| 1. Claim contract (approved to start) | aggregator + engine skeleton, V1 migration, `WorkItemRepository` (incl. revokeOwner and read-back), timed transactions, claim/renew SQL spike | ITs 1–5 |
-| 2. Runtime contracts | `ClaimHandle`, `QueueRunner` (poll, renewal, supervisor), `ItemProcessor`, `Sweeper`, `TimingBudget`, `RenewalSchedule`, metrics, health | §11.1 (incl. `LeaseSimulationTest`), ITs 6–12 |
+| 1. Claim contract (gate passed 2026-09-25) | aggregator + engine skeleton, V1 migration, `WorkItemRepository` (incl. revokeOwner and read-back), timed transactions, claim/renew SQL spike | ITs 1–5 |
+| 2. Runtime contracts (approved to start) | `ClaimHandle`, `QueueRunner` (poll, renewal, supervisor), `ItemProcessor`, `Sweeper`, `TimingBudget`, `RenewalSchedule`, metrics, health | §11.1 (incl. `LeaseSimulationTest`), ITs 6–12 |
 | 3. Operations | auto-configuration, `SchemaCheck`, admin, demo app, security, credentials, seed guard, verify, runbook, alerts | ITs 13–17 |
 | 4. Process evidence | process-level ITs, scripts, drain/crash/stale scenarios | §11.3 |
 | 5. Load | load ITs, baseline, `scenario-chaos.sh` | §11.4 |
@@ -1071,9 +1140,10 @@ only on that evidence.
 | `FINAL TABLE` over a searched UPDATE, or query-timeout close-socket mode, behaves unexpectedly | `WorkItemRepositoryIT` and `QueryTimeoutIT` in Phase 1. |
 | Simulating a lost commit acknowledgement reliably | A connection wrapper (commit, then throw) rather than network timing. |
 | The lease timing argument misses an interleaving | `LeaseSimulationTest` adds evidence over a finite grid of interleavings; `SustainedLoadIT` requires `claims.lost = 0`; `registration.late` exposes pauses the argument excludes. |
-| Tolerant defaults slow recovery (E1 108s) | Accepted initially; tightened only on Phase 1 and load-test latency evidence under contention. |
+| Tolerant defaults slow recovery (E1 118s) | Accepted initially; tightened only on Phase 1 and load-test latency evidence under contention. |
 | Lock escalation to a table lock | Claim batch ≤ 100, short transactions; `LOCKLIST`/`MAXLOCKS` guidance in the runbook. |
 | Creating a restricted Db2 user in the container (OS-level users) | `MigrationIT` creates it with `execInContainer`; if impractical, the least-privilege check moves to a documented manual step. |
+| Db2 server time zone observes daylight saving | UTC precondition (§5.1); `SchemaCheck` rejects a non-zero `CURRENT TIMEZONE`; runbook check (§9.7). |
 | Emulated Db2 is slow or unrepresentative | Reusable container; load numbers treated as a baseline only. |
 | Producer or downstream breaks the §5.4 contract (reused `OPERATION_ID`, short dedupe retention) | Documented deployment preconditions; unique constraint and column grants catch reuse and mutation inside this table only. |
 
@@ -1149,3 +1219,30 @@ and load validation.
 | Database collation precondition (`IDENTITY`); downstream compares keys exactly | Case-insensitive comparison would merge distinct ids. |
 | §6 claim SQL shows the spike's form A2; fallback paragraph replaced by the spike result | Db2 12.1 rejects the old primary form (SQLCODE -104); whether the fallback skips locked rows varies between runs. |
 | `ClaimSqlSpikeIT` asserts A2's acceptance, lock skipping and oldest-first order; the repository's lock-skip test also discriminates order | The spike stayed green as long as any form was accepted and skipped locks. |
+
+**Revision 8 (Phase 1 gate follow-ups):**
+
+| Change | Reason |
+|---|---|
+| The `Sweeper` sets `CLAIM_TOKEN + 1` and `OWNER = NULL` on the rows it fails, as `revokeOwner` does | Sweep kept the owner and token, so a late `retryOrFail` from the swept owner read back FAILED as its own write, reported `FAILED` instead of `FENCED`, and its error text was lost. |
+| Db2 must run in UTC (deployment precondition); `SchemaCheck` requires `CURRENT TIMEZONE = 0` | `CURRENT TIMESTAMP` is server-local time: daylight-saving transitions would expire every lease at once or delay expiry by an hour. |
+| The ERROR that Spring logs after a close-socket query timeout is expected and documented (§8) | The rollback fails on the closed connection; `WorkItemRepository` already surfaces the statement's own `DataAccessException`. |
+| Phase 2 ITs use a test-scope `RecordingDownstream`; Toxiproxy reaches Db2 through its host-mapped port | ITs 6–12 assert on downstream call outcomes, but the demo's simulated downstream arrives only in Phase 3. |
+
+**Revision 9 (Phase 2 planning, lease model):**
+
+| Change | Reason |
+|---|---|
+| E5 = `(F* − 1)·W + F*·d`, where `F*` is the largest `F` with `max(I, W) + 2W + G + F·(W + d) < L` (§5.3) | The old E5, `L − max(I, W) − 3W − d − G`, assumed an outage starts at the beginning of the round it fails. One that begins at the end of a round also fails it, and each retry during the outage costs `W + d`: with the old defaults a 1.2s outage lost a claim under a 16s target. A prototype of the §11.1 model confirmed the corrected formula to one 10ms step on 270 configurations, and that B2 is exact. |
+| Default lease 90s → 100s (E1 118s, E5 20s); IT lease 25s → 30s (E5 5.9s) | With the corrected formula, a 90s lease gives E5 = 1s and a 25s IT lease 0.2s, too short for `DbOutageIT`'s 1.5s short outage. |
+| `LeaseSimulationTest` also asserts that B2 and E5 are tight | A target the model cannot violate one step past its bound would not show that the formula is right. |
+| `LoadWithFaultsIT` outage 20s → 25s | It must still exceed the E5 target. |
+
+**Revision 10 (final review of Phase 2a):**
+
+| Change | Reason |
+|---|---|
+| E5 = `max(d, L − max(I, W) − 4W − d − G)` (§5.3, §7) | Revision 9 assumed failed outage rounds take exactly `W`, so a fast-failing retry chain whose last round hangs for `W` lost claims at the defaults after 8.02s against a claimed 20s. |
+| Leases kept at 100s / 30s, so E5 is 8s by default and 2.1s for ITs | Owner's decision; E1 stays 118s. |
+| `LeaseSimulation` lets a failed outage round fail as early as it can, at `W`, or aligned to the outage's last step, with a full-enumeration cross-check (§11.1) | A failed round takes up to `W`, and the model must cover the fast-failing retry chain. The round the outage begins in also needs the early failure: without it the reduced model found the first loss one step late near the B2 bound. |
+| §4 `OWNER` comment: current claim holder, NULL after revocation, sweep or replay | Sweep now clears `OWNER` (revision 8). |
