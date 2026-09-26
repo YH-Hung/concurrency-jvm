@@ -342,7 +342,7 @@ public class WorkItemRepository {
         return Math.toIntExact(settings.lease().toSeconds());
     }
 
-    private static void requireOwner(String owner) {
+    static void requireOwner(String owner) {
         Objects.requireNonNull(owner, "owner");
         if (owner.isBlank() || owner.getBytes(StandardCharsets.UTF_8).length > MAX_OWNER_BYTES) {
             throw new IllegalArgumentException("owner must be non-blank and at most " + MAX_OWNER_BYTES + " bytes");

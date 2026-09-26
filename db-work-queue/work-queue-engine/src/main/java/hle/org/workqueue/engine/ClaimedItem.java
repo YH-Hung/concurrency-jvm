@@ -13,4 +13,10 @@ public record ClaimedItem(long id, String operationId, String payload, long clai
     public ClaimKey key() {
         return new ClaimKey(id, claimToken);
     }
+
+    /** Only the row id and token: the engine never logs operation ids or payloads. */
+    @Override
+    public String toString() {
+        return "ClaimedItem[id=" + id + ", claimToken=" + claimToken + "]";
+    }
 }

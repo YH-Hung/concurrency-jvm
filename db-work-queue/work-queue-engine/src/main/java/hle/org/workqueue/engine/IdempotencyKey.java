@@ -17,13 +17,18 @@ public record IdempotencyKey(String namespace, String operationId) {
     private static final Pattern OPERATION_ID = Pattern.compile("[!-~]{1,64}");
 
     public IdempotencyKey {
-        Objects.requireNonNull(namespace, "namespace");
+        requireNamespace(namespace);
         Objects.requireNonNull(operationId, "operationId");
-        if (!NAMESPACE.matcher(namespace).matches()) {
-            throw new IllegalArgumentException("namespace must match ^[a-z0-9][a-z0-9-]{0,31}$");
-        }
         if (!OPERATION_ID.matcher(operationId).matches()) {
             throw new IllegalArgumentException("operationId must be 1 to 64 printable ASCII characters without spaces");
+        }
+    }
+
+    /** Throws unless {@code namespace} matches {@code ^[a-z0-9][a-z0-9-]{0,31}$}; the message never echoes it. */
+    static void requireNamespace(String namespace) {
+        Objects.requireNonNull(namespace, "namespace");
+        if (!NAMESPACE.matcher(namespace).matches()) {
+            throw new IllegalArgumentException("namespace must match ^[a-z0-9][a-z0-9-]{0,31}$");
         }
     }
 
