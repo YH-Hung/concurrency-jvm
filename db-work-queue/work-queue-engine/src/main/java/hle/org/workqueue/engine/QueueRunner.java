@@ -6,6 +6,9 @@ import org.slf4j.LoggerFactory;
 import org.springframework.context.SmartLifecycle;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -20,10 +23,11 @@ import java.util.function.LongSupplier;
 
 /**
  * Runs the queue on one instance (spec §5.2): the poll loop claims rows and starts one virtual thread per claim, the
- * renewal loop keeps the claims' leases, and the DB-free supervisor enforces deadlines and detects hung tasks. It
- * alone creates handles, starts their threads, and holds the registry and the permits; the permit invariant
- * {@code permits.available + handles not ended + held = concurrency} holds whenever the poll loop is between
- * iterations. Times are {@code System.nanoTime()} readings from the injected clock, compared overflow-safely.
+ * renewal loop keeps the claims' leases, and the DB-free supervisor enforces deadlines and detects hung tasks; two
+ * more loops run the {@link Sweeper} and the {@link BacklogSampler}. It alone creates handles, starts their threads,
+ * and holds the registry and the permits; the permit invariant {@code permits.available + handles not ended + held =
+ * concurrency} holds whenever the poll loop is between iterations. Times are {@code System.nanoTime()} readings from
+ * the injected clock, compared overflow-safely.
  */
 final class QueueRunner implements SmartLifecycle {
 
@@ -31,12 +35,14 @@ final class QueueRunner implements SmartLifecycle {
     record Settings(int concurrency, int claimBatchSize, Duration idlePollInterval, Duration pollBackoffMax,
                     Duration registrationAllowance, Duration renewInterval, Duration renewRetryDelay,
                     Duration maxProcessingTime, Duration supervisorInterval, Duration hungGrace, int hungTaskLimit,
-                    Duration shutdownGrace, Duration shutdownCancelWait) {
+                    Duration shutdownGrace, Duration shutdownCancelWait, Duration sweepInterval, int sweepBatchSize,
+                    Duration backlogSampleInterval) {
 
         Settings {
             requireAtLeastOne("concurrency", concurrency);
             requireAtLeastOne("claimBatchSize", claimBatchSize);
             requireAtLeastOne("hungTaskLimit", hungTaskLimit);
+            requireAtLeastOne("sweepBatchSize", sweepBatchSize);
             Durations.requirePositive("idlePollInterval", idlePollInterval);
             Durations.requirePositive("pollBackoffMax", pollBackoffMax);
             Durations.requirePositive("registrationAllowance", registrationAllowance);
@@ -47,6 +53,8 @@ final class QueueRunner implements SmartLifecycle {
             Durations.requirePositive("hungGrace", hungGrace);
             Durations.requirePositive("shutdownGrace", shutdownGrace);
             Durations.requirePositive("shutdownCancelWait", shutdownCancelWait);
+            Durations.requirePositive("sweepInterval", sweepInterval);
+            Durations.requirePositive("backlogSampleInterval", backlogSampleInterval);
         }
 
         static Settings from(WorkQueueProperties properties) {
@@ -55,7 +63,8 @@ final class QueueRunner implements SmartLifecycle {
                     properties.getRegistrationAllowance(), properties.getRenewInterval(),
                     properties.getRenewRetryDelay(), properties.getMaxProcessingTime(),
                     properties.getSupervisorInterval(), properties.getHungGrace(), properties.getHungTaskLimit(),
-                    properties.getShutdownGrace(), properties.getShutdownCancelWait());
+                    properties.getShutdownGrace(), properties.getShutdownCancelWait(), properties.getSweepInterval(),
+                    properties.getSweepBatchSize(), properties.getBacklogSampleInterval());
         }
 
         private static void requireAtLeastOne(String name, int value) {
@@ -82,7 +91,7 @@ final class QueueRunner implements SmartLifecycle {
             .name("workqueue-task-" + handle.key().id() + "-" + handle.key().token())
             .unstarted(body);
 
-    /** Starts the thread that runs one of the three loops. */
+    /** Starts the thread that runs one of the five loops. */
     @FunctionalInterface
     interface LoopThreads {
         Thread start(String name, Runnable loop);
@@ -91,7 +100,10 @@ final class QueueRunner implements SmartLifecycle {
     /** One named virtual thread per loop. */
     static final LoopThreads VIRTUAL_LOOP_THREADS = (name, loop) -> Thread.ofVirtual().name(name).start(loop);
 
-    /** How long {@link #stop()} waits for a loop thread after interrupting it; E2 leaves 5s for this and exit. */
+    /**
+     * How long {@link #stop()} waits, in all, for the loops that outlive the drain after interrupting them; E2 leaves
+     * 5s for this and exit.
+     */
     private static final Duration LOOP_JOIN_TIMEOUT = Duration.ofSeconds(1);
 
     /** How often {@link #stop()} checks whether the registry has emptied. */
@@ -109,10 +121,20 @@ final class QueueRunner implements SmartLifecycle {
     private final ConcurrentMap<ClaimKey, ClaimHandle> registry;
     private final Semaphore permits;
     private final RenewalSchedule schedule;
+    private final DbActivity dbActivity;
+    private final Sweeper sweeper;
+    private final BacklogSampler sampler;
 
+    // What health and the meters read (spec §9.6); WorkQueueMetrics binds them.
     private final AtomicLong invariantViolations = new AtomicLong();
     private final AtomicLong registrationsLate = new AtomicLong();
     private final AtomicLong claimsLost = new AtomicLong();
+    private final AtomicLong claims = new AtomicLong();
+    private final AtomicLong claimErrors = new AtomicLong();
+    private final OperationStats claimTimes = new OperationStats();
+    private final AtomicLong renewalErrors = new AtomicLong();
+    private final OperationStats renewalTimes = new OperationStats();
+    private final Map<Outcome, AtomicLong> outcomes = new EnumMap<>(Outcome.class);
 
     // cancelAll sets cancelOnRegister and walks the registry under this lock, and registerAndStart registers a
     // handle and reads cancelOnRegister under it, so a handle is either in the registry when a cancel pass walks it
@@ -134,9 +156,13 @@ final class QueueRunner implements SmartLifecycle {
     private volatile boolean polling;
     private volatile boolean renewing;
     private volatile boolean supervising;
+    private volatile boolean sweeping;
+    private volatile boolean sampling;
     private Thread pollThread;
     private Thread renewalThread;
     private Thread supervisorThread;
+    private Thread sweeperThread;
+    private Thread samplerThread;
 
     QueueRunner(WorkItemRepository repository, Processor processor, String owner, Settings settings) {
         this(repository, processor, owner, settings, VIRTUAL_THREADS, System::nanoTime, new ConcurrentHashMap<>());
@@ -163,11 +189,17 @@ final class QueueRunner implements SmartLifecycle {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.permits = new Semaphore(settings.concurrency());
         this.schedule = new RenewalSchedule(settings.renewInterval(), settings.renewRetryDelay());
+        this.dbActivity = new DbActivity(clock);
+        this.sweeper = new Sweeper(repository, owner, settings.sweepBatchSize(), dbActivity);
+        this.sampler = new BacklogSampler(repository, owner, dbActivity);
+        for (Outcome outcome : Outcome.values()) {
+            outcomes.put(outcome, new AtomicLong());
+        }
     }
 
     // ---- Lifecycle -------------------------------------------------------------------------------------------
 
-    /** Starts the three loops. A runner starts once: after stop() or crash() it cannot be started again. */
+    /** Starts the five loops. A runner starts once: after stop() or crash() it cannot be started again. */
     @Override
     public void start() {
         synchronized (lifecycle) {
@@ -181,22 +213,27 @@ final class QueueRunner implements SmartLifecycle {
             polling = true;
             renewing = true;
             supervising = true;
+            sweeping = true;
+            sampling = true;
             try {
                 pollThread = loopThreads.start("workqueue-poll", this::pollLoop);
                 renewalThread = loopThreads.start("workqueue-renewal", this::renewalLoop);
                 supervisorThread = loopThreads.start("workqueue-supervisor", this::supervisorLoop);
+                sweeperThread = loopThreads.start("workqueue-sweeper", this::sweeperLoop);
+                samplerThread = loopThreads.start("workqueue-backlog-sampler", this::samplerLoop);
             } catch (Throwable t) {
                 // running stays false, so stop() would do nothing: end the loops that did start here, and cancel
                 // whatever the poll loop registers from a claim that was already in flight.
                 polling = false;
                 renewing = false;
                 supervising = false;
+                sweeping = false;
+                sampling = false;
                 cancelAll(CancelReason.SHUTDOWN);
-                if (pollThread != null) {
-                    pollThread.interrupt();
-                }
-                if (renewalThread != null) {
-                    renewalThread.interrupt();
+                for (Thread loop : Arrays.asList(pollThread, renewalThread, supervisorThread, sweeperThread)) {
+                    if (loop != null) {
+                        loop.interrupt();
+                    }
                 }
                 throw t;
             }
@@ -213,8 +250,8 @@ final class QueueRunner implements SmartLifecycle {
     /**
      * The stop sequence of spec §5.2: stop claiming (a claim that already returned is still started), wait up to
      * shutdown-grace for the running tasks with renewal still running, cancel what is left, wait up to
-     * shutdown-cancel-wait, then stop renewal and the supervisor. Nothing is released in Db2: a claim still held
-     * expires with its attempt consumed.
+     * shutdown-cancel-wait, then stop renewal, the supervisor, the sweeper and the backlog sampler, waiting at most
+     * 1s for them in all. Nothing is released in Db2: a claim still held expires with its attempt consumed.
      */
     @Override
     public void stop() {
@@ -232,10 +269,14 @@ final class QueueRunner implements SmartLifecycle {
             awaitDrained(clock.getAsLong() + settings.shutdownCancelWait().toNanos());
             renewing = false;
             supervising = false;
-            renewalThread.interrupt();
-            supervisorThread.interrupt();
-            join(renewalThread, LOOP_JOIN_TIMEOUT);
-            join(supervisorThread, LOOP_JOIN_TIMEOUT);
+            sweeping = false;
+            sampling = false;
+            List<Thread> loops = List.of(renewalThread, supervisorThread, sweeperThread, samplerThread);
+            loops.forEach(Thread::interrupt);
+            long joinDeadline = clock.getAsLong() + LOOP_JOIN_TIMEOUT.toNanos();
+            for (Thread loop : loops) {
+                join(loop, remaining(joinDeadline));
+            }
             running = false;
         }
     }
@@ -250,12 +291,16 @@ final class QueueRunner implements SmartLifecycle {
         polling = false;
         renewing = false;
         supervising = false;
+        sweeping = false;
+        sampling = false;
         cancelAll(CancelReason.CRASH);
         synchronized (lifecycle) {
             if (running) {
                 pollThread.interrupt();
                 renewalThread.interrupt();
                 supervisorThread.interrupt();
+                sweeperThread.interrupt();
+                samplerThread.interrupt();
                 running = false;
             }
         }
@@ -263,9 +308,8 @@ final class QueueRunner implements SmartLifecycle {
 
     // ---- Poll loop -------------------------------------------------------------------------------------------
 
-    // Each loop survives a RuntimeException. An Error ends the loop, for slice 2.6's liveness to report as a dead
-    // loop; it is caught only to be logged by its diagnostics: the thread's default handler would print its message
-    // (spec §5.4).
+    // Each loop survives a RuntimeException. An Error ends the loop, which deadLoops() then reports to liveness; it is
+    // caught only to be logged by its diagnostics: the thread's default handler would print its message (spec §5.4).
     private void pollLoop() {
         try {
             while (polling) {
@@ -304,13 +348,16 @@ final class QueueRunner implements SmartLifecycle {
             while (held < settings.claimBatchSize() && permits.tryAcquire()) {
                 held++;
             }
-            if (claimingPaused()) {
+            if (hungTaskLimitReached()) {
                 return settings.supervisorInterval();
             }
+            long claimStartedAt = clock.getAsLong();
             List<ClaimedItem> claimed;
             try {
                 claimed = repository.claim(owner, held);
             } catch (RuntimeException e) {
+                claimTimes.record(clock.getAsLong() - claimStartedAt);
+                claimErrors.incrementAndGet();
                 // The outcome is uncertain: rows may have committed. They are never registered, so they expire
                 // unrenewed with their attempt consumed (spec §5.2).
                 Duration pause = backoff();
@@ -319,6 +366,9 @@ final class QueueRunner implements SmartLifecycle {
                 return pause;
             }
             long claimedAt = clock.getAsLong();
+            claimTimes.record(claimedAt - claimStartedAt);
+            claims.incrementAndGet();
+            dbActivity.succeeded();
             claimFailures = 0;
             if (claimed.size() > held) {
                 // Only the first held rows get a permit. The rest are CLAIMED but never registered, so, like the rows
@@ -329,7 +379,8 @@ final class QueueRunner implements SmartLifecycle {
                 claimed = claimed.subList(0, held);
             }
             for (ClaimedItem item : claimed) {
-                ClaimHandle handle = new ClaimHandle(item, claimedAt, settings.maxProcessingTime(), registry, permits);
+                ClaimHandle handle = new ClaimHandle(item, claimStartedAt, claimedAt, settings.maxProcessingTime(),
+                        registry, permits);
                 Thread thread = Objects.requireNonNull(taskThreads.newThread(handle, () -> runTask(handle)), "thread");
                 held--;   // the transfer: from here on the handle owns this permit
                 registerAndStart(handle, thread, claimedAt);
@@ -368,22 +419,20 @@ final class QueueRunner implements SmartLifecycle {
     }
 
     // Spec §5.2 step 4. Catches every Throwable: an uncaught one would reach the thread's default handler, which
-    // prints its message (spec §5.4).
+    // prints its message (spec §5.4). A task cancelled before its body ran ends CANCELLED; one that threw has no
+    // outcome.
     private void runTask(ClaimHandle handle) {
         try {
-            if (handle.markRunning()) {
-                Outcome outcome = processor.process(handle.item(), handle::isCancelled);
-                log.debug("Claim {} of owner {} ended {}", handle, owner, outcome);
-            }
+            Outcome outcome = handle.markRunning()
+                    ? processor.process(handle.item(), handle::isCancelled)
+                    : Outcome.CANCELLED;
+            outcomes.get(Objects.requireNonNull(outcome, "outcome")).incrementAndGet();
+            log.debug("Claim {} of owner {} ended {}", handle, owner, outcome);
         } catch (Throwable t) {
             log.error("Task for claim {} of owner {} failed: {}", handle, owner, Diagnostics.describe(t));
         } finally {
             handle.finish();
         }
-    }
-
-    private boolean claimingPaused() {
-        return hungTasks() >= settings.hungTaskLimit();
     }
 
     // The idle interval ± 50%, so idle instances do not poll in step.
@@ -428,8 +477,9 @@ final class QueueRunner implements SmartLifecycle {
 
     /**
      * One renewal round (spec §5.3) over a snapshot, taken at its start, of the handles that are renewable then.
-     * Every claim the round reports lost is counted and cancelled; a claim its own task already ended is neither, and
-     * a lost claim the round did not request is an invariant violation.
+     * Every claim the round renews has its lease counted from the round's start. Every claim it reports lost is
+     * counted and cancelled; a claim its own task already ended is neither, and a lost claim the round did not
+     * request is an invariant violation.
      * Returns whether the round succeeded; a round with nothing to renew is skipped and succeeds.
      */
     boolean renewOnce() {
@@ -447,10 +497,20 @@ final class QueueRunner implements SmartLifecycle {
         try {
             result = repository.renew(owner, snapshot.keySet());
         } catch (RuntimeException e) {
+            renewalTimes.record(clock.getAsLong() - start);
+            renewalErrors.incrementAndGet();
             log.warn("Renewal of {} claims of owner {} failed: {}", snapshot.size(), owner, Diagnostics.describe(e));
             return false;
         }
         long now = clock.getAsLong();
+        renewalTimes.record(now - start);
+        dbActivity.succeeded();
+        for (ClaimKey key : result.renewed()) {
+            ClaimHandle handle = snapshot.get(key);
+            if (handle != null) {   // the repository renews only the pairs it was given
+                handle.leaseRenewed(start);
+            }
+        }
         for (ClaimKey key : result.lost()) {
             ClaimHandle handle = snapshot.get(key);
             if (handle == null) {
@@ -511,7 +571,42 @@ final class QueueRunner implements SmartLifecycle {
         return text.toString();
     }
 
-    // ---- State for health and metrics (slice 2.6) and tests --------------------------------------------------
+    // ---- Sweeper and backlog sampler -------------------------------------------------------------------------
+
+    private void sweeperLoop() {
+        passLoop("Sweeper", () -> sweeping, this::sweepOnce, settings.sweepInterval());
+    }
+
+    private void samplerLoop() {
+        passLoop("Backlog sampler", () -> sampling, this::sampleOnce, settings.backlogSampleInterval());
+    }
+
+    // A pass, then the interval, until stopped. A pass logs its own failures, so only an Error ends the loop; it is
+    // logged, and liveness does not watch these two loops (spec §9.6).
+    private void passLoop(String name, BooleanSupplier active, Runnable pass, Duration interval) {
+        try {
+            while (active.getAsBoolean()) {
+                pass.run();
+                if (!sleep(interval)) {
+                    return;
+                }
+            }
+        } catch (Throwable t) {
+            log.error("{} loop of owner {} died: {}", name, owner, Diagnostics.describe(t));
+        }
+    }
+
+    /** One sweeper pass (spec §6), which the sweeper loop repeats every sweep-interval. Returns the rows swept. */
+    int sweepOnce() {
+        return sweeper.sweepOnce();
+    }
+
+    /** One backlog sample (spec §9.6), which the sampler loop repeats every backlog-sample-interval. */
+    boolean sampleOnce() {
+        return sampler.sampleOnce();
+    }
+
+    // ---- State for health, metrics and tests -----------------------------------------------------------------
 
     int availablePermits() {
         return permits.availablePermits();
@@ -532,6 +627,40 @@ final class QueueRunner implements SmartLifecycle {
         return hung;
     }
 
+    /** Hung tasks have reached hung-task-limit: the poll loop stops claiming and liveness reports DOWN. */
+    boolean hungTaskLimitReached() {
+        return hungTasks() >= settings.hungTaskLimit();
+    }
+
+    /**
+     * The loops liveness watches (spec §9.6) that ended while the runner still wanted them: an Error ended them, or
+     * an interrupt that was not stop()'s or crash()'s. Loops that stop() or crash() ended are not dead. Each check
+     * reads the thread before its run flag: a thread's end happens-before it is seen ended, and stop() and crash()
+     * clear the flag before they interrupt, so a loop they ended always shows its flag cleared. Reading the flag
+     * first could see it still set just before stop() cleared it and the loop ended.
+     */
+    List<String> deadLoops() {
+        if (!running) {
+            return List.of();
+        }
+        List<String> dead = new ArrayList<>(3);
+        if (!pollThread.isAlive() && polling) {
+            dead.add("poll");
+        }
+        if (!renewalThread.isAlive() && renewing) {
+            dead.add("renewal");
+        }
+        if (!supervisorThread.isAlive() && supervising) {
+            dead.add("supervisor");
+        }
+        return dead;
+    }
+
+    /** The latest backlog sample (spec §9.6 backlog gauges), or null before the first. */
+    BacklogSample backlog() {
+        return sampler.latest();
+    }
+
     long invariantViolations() {
         return invariantViolations.get();
     }
@@ -542,6 +671,55 @@ final class QueueRunner implements SmartLifecycle {
 
     long claimsLost() {
         return claimsLost.get();
+    }
+
+    /** Claim operations that returned, with rows or without. */
+    long claims() {
+        return claims.get();
+    }
+
+    /** Claim operations that failed: their outcome is unknown. */
+    long claimErrors() {
+        return claimErrors.get();
+    }
+
+    /** The duration of every claim operation, returned or failed. */
+    OperationStats claimTimes() {
+        return claimTimes;
+    }
+
+    long renewalErrors() {
+        return renewalErrors.get();
+    }
+
+    /** The duration of every renewal round that ran; a skipped round is not one. */
+    OperationStats renewalTimes() {
+        return renewalTimes;
+    }
+
+    /** Tasks that ended with {@code outcome}. */
+    long outcomes(Outcome outcome) {
+        return outcomes.get(Objects.requireNonNull(outcome, "outcome")).get();
+    }
+
+    /**
+     * Spec §9.6 {@code renewal.lag}: the longest time since a renewal-eligible claim's lease was last written, counted
+     * from the start of the operation that wrote it; zero without renewal-eligible claims.
+     */
+    Duration renewalLag() {
+        long now = clock.getAsLong();
+        long lag = 0;
+        for (ClaimHandle handle : registry.values()) {
+            if (handle.isRenewable(now)) {
+                lag = Math.max(lag, now - handle.leaseWrittenAt());
+            }
+        }
+        return Duration.ofNanos(lag);
+    }
+
+    /** Spec §9.6 {@code db.last_success_age}. */
+    Duration dbLastSuccessAge() {
+        return dbActivity.lastSuccessAge();
     }
 
     /** True from the start of {@link #stop()}: readiness reports DOWN. */

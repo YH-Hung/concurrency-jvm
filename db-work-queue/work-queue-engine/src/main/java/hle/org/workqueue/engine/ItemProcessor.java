@@ -4,8 +4,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.util.EnumMap;
+import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.TimeoutException;
 import java.util.function.BooleanSupplier;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 /**
@@ -45,6 +49,18 @@ final class ItemProcessor {
         void sleep(Duration duration) throws InterruptedException;
     }
 
+    /** How an external call ended, for {@code call.duration{result}} (spec §9.6). */
+    enum CallStatus {
+        /** It returned a result. */
+        OK,
+        /** It threw, or returned no result. */
+        ERROR,
+        /** It threw a {@link TimeoutException}: external-call-timeout passed. */
+        TIMEOUT,
+        /** It threw InterruptedException, or the interrupt status was set when it returned or threw. */
+        INTERRUPTED
+    }
+
     static final String NO_RESULT_ERROR = "the external service returned no result";
     static final String INVALID_OPERATION_ID_ERROR = "OPERATION_ID is not a valid operation identity; not called";
 
@@ -56,6 +72,8 @@ final class ItemProcessor {
     private final String namespace;
     private final Settings settings;
     private final Sleeper sleeper;
+    private final LongSupplier clock;
+    private final Map<CallStatus, OperationStats> calls = new EnumMap<>(CallStatus.class);
 
     ItemProcessor(WorkItemRepository repository, ExternalService service, String owner, String namespace,
                   Settings settings) {
@@ -64,6 +82,12 @@ final class ItemProcessor {
 
     ItemProcessor(WorkItemRepository repository, ExternalService service, String owner, String namespace,
                   Settings settings, Sleeper sleeper) {
+        this(repository, service, owner, namespace, settings, sleeper, System::nanoTime);
+    }
+
+    /** For tests: the clock that times the calls is injectable. */
+    ItemProcessor(WorkItemRepository repository, ExternalService service, String owner, String namespace,
+                  Settings settings, Sleeper sleeper, LongSupplier clock) {
         WorkItemRepository.requireOwner(owner);
         IdempotencyKey.requireNamespace(namespace);
         this.repository = Objects.requireNonNull(repository, "repository");
@@ -72,6 +96,10 @@ final class ItemProcessor {
         this.namespace = namespace;
         this.settings = Objects.requireNonNull(settings, "settings");
         this.sleeper = Objects.requireNonNull(sleeper, "sleeper");
+        this.clock = Objects.requireNonNull(clock, "clock");
+        for (CallStatus status : CallStatus.values()) {
+            calls.put(status, new OperationStats());
+        }
     }
 
     /** Processes {@code item}; {@code cancelled} reports whether its handle was cancelled. */
@@ -87,21 +115,41 @@ final class ItemProcessor {
             return failed(item, INVALID_OPERATION_ID_ERROR);
         }
         CallResult result;
+        long callStart = clock.getAsLong();
         try {
             result = service.call(key, item.claimToken(), item.payload(), settings.externalCallTimeout());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return Outcome.INTERRUPTED;
+            return interrupted(callStart);
         } catch (Exception e) {
-            return Thread.currentThread().isInterrupted() ? Outcome.INTERRUPTED : failed(item, describe(e));
+            if (Thread.currentThread().isInterrupted()) {
+                return interrupted(callStart);
+            }
+            timeCall(e instanceof TimeoutException ? CallStatus.TIMEOUT : CallStatus.ERROR, callStart);
+            return failed(item, describe(e));
         }
         if (Thread.currentThread().isInterrupted()) {
-            return Outcome.INTERRUPTED;
+            return interrupted(callStart);
         }
+        timeCall(result == null ? CallStatus.ERROR : CallStatus.OK, callStart);
         if (result == null) {
             return failed(item, NO_RESULT_ERROR);
         }
         return persist(item, () -> repository.complete(owner, item.key(), result.value()));
+    }
+
+    /** The calls that ended with {@code status}, and how long they took. */
+    OperationStats calls(CallStatus status) {
+        return calls.get(Objects.requireNonNull(status, "status"));
+    }
+
+    private Outcome interrupted(long callStart) {
+        timeCall(CallStatus.INTERRUPTED, callStart);
+        return Outcome.INTERRUPTED;
+    }
+
+    private void timeCall(CallStatus status, long callStart) {
+        calls.get(status).record(clock.getAsLong() - callStart);
     }
 
     private Outcome failed(ClaimedItem item, String error) {

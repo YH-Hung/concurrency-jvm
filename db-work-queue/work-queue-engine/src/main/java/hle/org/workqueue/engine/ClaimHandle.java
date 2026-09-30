@@ -42,17 +42,26 @@ final class ClaimHandle {
     private CancelReason cancelReason;
     private long cancelledAt;
 
+    // Only the renewal loop writes it after construction; the gauges read it.
+    private volatile long leaseWrittenAt;
+
     /**
      * Has no side effects: the poll loop still owns the permit until it transfers it after construction.
      *
-     * @param claimedAt when the claim operation returned; the deadline and the registration-late check count from it
+     * @param claimStartedAt when the claim operation started: its lease-setting write came no earlier (spec §5.3)
+     * @param claimedAt      when the claim operation returned; the deadline and the registration-late check count
+     *                       from it
      */
-    ClaimHandle(ClaimedItem item, long claimedAt, Duration maxProcessingTime, Map<ClaimKey, ClaimHandle> registry,
-                Semaphore permits) {
+    ClaimHandle(ClaimedItem item, long claimStartedAt, long claimedAt, Duration maxProcessingTime,
+                Map<ClaimKey, ClaimHandle> registry, Semaphore permits) {
         this.item = Objects.requireNonNull(item, "item");
         Durations.requirePositive("maxProcessingTime", maxProcessingTime);
+        if (claimedAt - claimStartedAt < 0) {
+            throw new IllegalArgumentException("claimedAt is before claimStartedAt");
+        }
         this.claimedAt = claimedAt;
         this.deadline = claimedAt + maxProcessingTime.toNanos();
+        this.leaseWrittenAt = claimStartedAt;
         this.registry = Objects.requireNonNull(registry, "registry");
         this.permits = Objects.requireNonNull(permits, "permits");
     }
@@ -72,6 +81,20 @@ final class ClaimHandle {
     /** claimedAt + max-processing-time: the supervisor cancels the claim here, and renewal stops. */
     long deadline() {
         return deadline;
+    }
+
+    /**
+     * The start of the operation that last wrote this claim's lease: its claim operation, then the last renewal round
+     * that renewed it. The write itself came no earlier, so the lease lasts at least lease-duration from here (spec
+     * §5.3); {@code renewal.lag} counts from it (spec §9.6).
+     */
+    long leaseWrittenAt() {
+        return leaseWrittenAt;
+    }
+
+    /** A renewal round that started at {@code roundStart} renewed this claim's lease. */
+    void leaseRenewed(long roundStart) {
+        leaseWrittenAt = roundStart;
     }
 
     /**

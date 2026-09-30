@@ -221,6 +221,34 @@ public class WorkItemRepository {
     }
 
     /**
+     * One backlog sample (spec §9.6) in one query. It reads only unfinished rows, so Db2 can answer from
+     * IX_WORK_ITEM_CLAIM without visiting DONE rows. It is an uncommitted read: it never waits for row locks, whatever
+     * the database's cur_commit setting, and may count a claim or persist still in flight, which gauges tolerate.
+     */
+    public BacklogSample sampleBacklog() {
+        return inTransaction(jdbc -> jdbc.sql("""
+                SELECT COUNT(CASE WHEN STATUS = 'PENDING' THEN 1 END) AS PENDING,
+                       COUNT(CASE WHEN STATUS = 'CLAIMED' THEN 1 END) AS CLAIMED,
+                       COUNT(CASE WHEN STATUS = 'FAILED' THEN 1 END) AS FAILED,
+                       COUNT(CASE WHEN STATUS = 'CLAIMED'
+                                   AND AVAILABLE_AT < CURRENT TIMESTAMP - (CAST(:leaseSeconds AS INTEGER)) SECONDS
+                                  THEN 1 END) AS EXPIRED_CLAIMS,
+                       SECONDS_BETWEEN(CURRENT TIMESTAMP,
+                                       MIN(CASE WHEN STATUS = 'PENDING' AND AVAILABLE_AT <= CURRENT TIMESTAMP
+                                                THEN AVAILABLE_AT END)) AS OLDEST_PENDING_SECONDS
+                  FROM WORK_ITEM
+                 WHERE STATUS IN ('PENDING', 'CLAIMED', 'FAILED')
+                 WITH UR
+                """)
+                .param("leaseSeconds", leaseSeconds())
+                // OLDEST_PENDING_SECONDS is NULL without a claimable PENDING row, and getLong reads NULL as 0.
+                .query((rs, rowNum) -> new BacklogSample(rs.getLong("PENDING"), rs.getLong("CLAIMED"),
+                        rs.getLong("FAILED"), rs.getLong("EXPIRED_CLAIMS"),
+                        Duration.ofSeconds(rs.getLong("OLDEST_PENDING_SECONDS"))))
+                .single());
+    }
+
+    /**
      * Operator replay of FAILED rows (spec §9.7). A dry run counts the matching rows; otherwise they become
      * PENDING with ATTEMPTS = 0 and no owner, keeping CLAIM_TOKEN and OPERATION_ID.
      */

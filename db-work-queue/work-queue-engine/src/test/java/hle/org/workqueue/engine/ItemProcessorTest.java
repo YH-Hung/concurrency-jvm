@@ -4,6 +4,7 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import hle.org.workqueue.engine.ItemProcessor.CallStatus;
 import hle.org.workqueue.engine.ScriptedRepository.Write;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -15,8 +16,11 @@ import org.springframework.dao.DataAccessResourceFailureException;
 import java.sql.SQLTransientConnectionException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static hle.org.workqueue.engine.ScriptedRepository.Operation.COMPLETE;
 import static hle.org.workqueue.engine.ScriptedRepository.Operation.RETRY_OR_FAIL;
@@ -24,6 +28,7 @@ import static java.time.Duration.ofMillis;
 import static java.time.Duration.ofSeconds;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.entry;
 
 class ItemProcessorTest {
 
@@ -325,6 +330,69 @@ class ItemProcessorTest {
         assertThat(repository.writes()).isEmpty();
     }
 
+    // ---- Call durations (spec §9.6 call.duration) -----------------------------------------------------------
+
+    @Test
+    void aCallIsTimedFromItsStartToItsReturn() {
+        repository.thenReturn(PersistResult.DONE);
+        AtomicLong now = new AtomicLong(Long.MAX_VALUE - 1_000_000_000L);   // the call ends past the overflow
+        ItemProcessor processor = new ItemProcessor(repository, (key, token, payload, timeout) -> {
+            now.addAndGet(2_000_000_000L);
+            return new CallResult("receipt-7");
+        }, OWNER, NAMESPACE, SETTINGS, sleeps::add, now::get);
+
+        processor.process(ITEM, () -> false);
+
+        assertThat(processor.calls(CallStatus.OK).count()).isEqualTo(1);
+        assertThat(processor.calls(CallStatus.OK).totalNanos()).isEqualTo(2_000_000_000L);
+    }
+
+    @Test
+    void aCallIsTimedByHowItEnded() {
+        repository.thenReturn(PersistResult.DONE);
+        assertThat(timedCalls(returning("receipt-7"))).containsExactly(entry(CallStatus.OK, 1L));
+
+        repository.thenReturn(PersistResult.RETRY_SCHEDULED);
+        assertThat(timedCalls(throwing(new IllegalStateException("downstream said no"))))
+                .containsExactly(entry(CallStatus.ERROR, 1L));
+
+        repository.thenReturn(PersistResult.RETRY_SCHEDULED);
+        assertThat(timedCalls((key, token, payload, timeout) -> null)).containsExactly(entry(CallStatus.ERROR, 1L));
+
+        repository.thenReturn(PersistResult.RETRY_SCHEDULED);
+        assertThat(timedCalls(throwing(new TimeoutException("3s passed"))))
+                .containsExactly(entry(CallStatus.TIMEOUT, 1L));
+    }
+
+    @Test
+    void anInterruptedCallIsTimedInterruptedHoweverItEnded() {
+        assertThat(timedCalls(throwing(new InterruptedException())))
+                .containsExactly(entry(CallStatus.INTERRUPTED, 1L));
+        Thread.interrupted();
+
+        assertThat(timedCalls((key, token, payload, timeout) -> {
+            Thread.currentThread().interrupt();
+            return new CallResult("receipt-7");
+        })).containsExactly(entry(CallStatus.INTERRUPTED, 1L));
+        Thread.interrupted();
+
+        assertThat(timedCalls((key, token, payload, timeout) -> {
+            Thread.currentThread().interrupt();
+            throw new TimeoutException("request aborted");
+        })).containsExactly(entry(CallStatus.INTERRUPTED, 1L));
+    }
+
+    @Test
+    void noCallIsNotTimed() {
+        ItemProcessor processor = processor(returning("receipt-7"));
+        repository.thenReturn(PersistResult.RETRY_SCHEDULED);
+
+        processor.process(ITEM, () -> true);                                          // cancelled
+        processor.process(new ClaimedItem(8, "has space", "payload-8", 1), () -> false);   // invalid OPERATION_ID
+
+        assertThat(timed(processor)).isEmpty();
+    }
+
     @Test
     void rejectsAnInvalidOwnerOrNamespace() {
         assertThatThrownBy(() -> new ItemProcessor(repository, returning("r"), " ", NAMESPACE, SETTINGS))
@@ -353,6 +421,24 @@ class ItemProcessorTest {
 
     private Outcome process(ExternalService service) {
         return processor(service).process(ITEM, () -> false);
+    }
+
+    // Processes ITEM once with a new processor and returns its call counts by status, leaving out the zeros.
+    private Map<CallStatus, Long> timedCalls(ExternalService service) {
+        ItemProcessor processor = processor(service);
+        processor.process(ITEM, () -> false);
+        return timed(processor);
+    }
+
+    private static Map<CallStatus, Long> timed(ItemProcessor processor) {
+        Map<CallStatus, Long> timed = new EnumMap<>(CallStatus.class);
+        for (CallStatus status : CallStatus.values()) {
+            long count = processor.calls(status).count();
+            if (count > 0) {
+                timed.put(status, count);
+            }
+        }
+        return timed;
     }
 
     private ItemProcessor processor(ExternalService service) {

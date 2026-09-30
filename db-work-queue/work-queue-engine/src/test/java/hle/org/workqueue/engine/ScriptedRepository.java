@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -18,9 +19,9 @@ import static java.util.stream.Collectors.toSet;
 /**
  * A WorkItemRepository for unit tests that never touches a database. Every operation answers from its own script,
  * in order, and is recorded. An unscripted persist fails the test with an AssertionError; an unscripted claim
- * finds nothing, and an unscripted renewal renews every claim. It is thread-safe: the poll loop, the renewal loop
- * and task threads call it concurrently, and a step runs outside any lock, so one that blocks holds up only its
- * own caller.
+ * finds nothing, an unscripted renewal renews every claim, an unscripted sweep sweeps nothing, and an unscripted
+ * sample finds an empty queue. It is thread-safe: the runner's loops and task threads call it concurrently, and a
+ * step runs outside any lock, so one that blocks holds up only its own caller.
  */
 class ScriptedRepository extends WorkItemRepository {
 
@@ -36,6 +37,10 @@ class ScriptedRepository extends WorkItemRepository {
     private final List<Integer> claimSizes = new CopyOnWriteArrayList<>();
     private final Deque<Function<Set<ClaimKey>, RenewalResult>> renewals = new ConcurrentLinkedDeque<>();
     private final List<Set<ClaimKey>> renewRequests = new CopyOnWriteArrayList<>();
+    private final Deque<Supplier<Integer>> sweeps = new ConcurrentLinkedDeque<>();
+    private final List<Integer> sweepSizes = new CopyOnWriteArrayList<>();
+    private final Deque<Supplier<BacklogSample>> samples = new ConcurrentLinkedDeque<>();
+    private final AtomicInteger sampleCount = new AtomicInteger();
 
     ScriptedRepository() {
         super(new DriverManagerDataSource(), DbTimeouts.defaults(),
@@ -100,6 +105,42 @@ class ScriptedRepository extends WorkItemRepository {
         return this;
     }
 
+    /** The next sweeps return these counts, one sweep per count. */
+    ScriptedRepository thenSweep(int... counts) {
+        for (int count : counts) {
+            thenSweep(() -> count);
+        }
+        return this;
+    }
+
+    ScriptedRepository thenSweepThrow(RuntimeException failure) {
+        return thenSweep(() -> {
+            throw failure;
+        });
+    }
+
+    /** The next sweep runs {@code step}. */
+    ScriptedRepository thenSweep(Supplier<Integer> step) {
+        sweeps.add(step);
+        return this;
+    }
+
+    ScriptedRepository thenSample(BacklogSample sample) {
+        return thenSample(() -> sample);
+    }
+
+    ScriptedRepository thenSampleThrow(RuntimeException failure) {
+        return thenSample(() -> {
+            throw failure;
+        });
+    }
+
+    /** The next backlog sample runs {@code step}. */
+    ScriptedRepository thenSample(Supplier<BacklogSample> step) {
+        samples.add(step);
+        return this;
+    }
+
     List<Write> writes() {
         return List.copyOf(writes);
     }
@@ -112,6 +153,16 @@ class ScriptedRepository extends WorkItemRepository {
     /** The claims every renewal round asked to renew, in order. */
     List<Set<ClaimKey>> renewRequests() {
         return List.copyOf(renewRequests);
+    }
+
+    /** The batch size of every sweep, in order. */
+    List<Integer> sweepSizes() {
+        return List.copyOf(sweepSizes);
+    }
+
+    /** How many backlog samples were taken. */
+    int samples() {
+        return sampleCount.get();
     }
 
     @Override
@@ -127,6 +178,20 @@ class ScriptedRepository extends WorkItemRepository {
         renewRequests.add(requested);
         Function<Set<ClaimKey>, RenewalResult> step = renewals.poll();
         return step == null ? new RenewalResult(requested, Set.of(), Set.of()) : step.apply(requested);
+    }
+
+    @Override
+    public int sweep(int batchSize) {
+        sweepSizes.add(batchSize);
+        Supplier<Integer> step = sweeps.poll();
+        return step == null ? 0 : step.get();
+    }
+
+    @Override
+    public BacklogSample sampleBacklog() {
+        sampleCount.incrementAndGet();
+        Supplier<BacklogSample> step = samples.poll();
+        return step == null ? new BacklogSample(0, 0, 0, 0, Duration.ZERO) : step.get();
     }
 
     @Override

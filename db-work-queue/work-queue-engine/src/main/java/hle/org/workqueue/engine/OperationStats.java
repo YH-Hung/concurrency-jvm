@@ -1,0 +1,26 @@
+package hle.org.workqueue.engine;
+
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * The count and total duration of one kind of operation (spec §9.6 timers), which a Micrometer FunctionTimer reads
+ * when scraped. Durations are differences of {@code System.nanoTime()} readings, so never negative.
+ */
+final class OperationStats {
+
+    private final AtomicLong count = new AtomicLong();
+    private final AtomicLong totalNanos = new AtomicLong();
+
+    void record(long nanos) {
+        count.incrementAndGet();
+        totalNanos.addAndGet(nanos);
+    }
+
+    long count() {
+        return count.get();
+    }
+
+    long totalNanos() {
+        return totalNanos.get();
+    }
+}

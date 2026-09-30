@@ -52,8 +52,25 @@ class ClaimHandleTest {
 
     @Test
     void rejectsANonPositiveMaxProcessingTime() {
-        assertThatThrownBy(() -> new ClaimHandle(item(1, 1), 0, Duration.ZERO, registry, permits))
+        assertThatThrownBy(() -> new ClaimHandle(item(1, 1), 0, 0, Duration.ZERO, registry, permits))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("maxProcessingTime");
+    }
+
+    @Test
+    void rejectsAClaimThatReturnedBeforeItStarted() {
+        assertThatThrownBy(() -> new ClaimHandle(item(1, 1), 2 * SECOND, SECOND, MAX_PROCESSING_TIME, registry,
+                permits)).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("claimStartedAt");
+    }
+
+    @Test
+    void theLeaseCountsFromTheClaimOperationsStartUntilARoundRenewsIt() {
+        ClaimHandle handle = new ClaimHandle(item(1, 1), Long.MAX_VALUE - SECOND, Long.MAX_VALUE + SECOND,
+                MAX_PROCESSING_TIME, registry, permits);   // the claim took 2s, across the overflow
+        assertThat(handle.leaseWrittenAt()).isEqualTo(Long.MAX_VALUE - SECOND);
+
+        handle.leaseRenewed(Long.MAX_VALUE + 15 * SECOND);
+
+        assertThat(handle.leaseWrittenAt()).isEqualTo(Long.MAX_VALUE + 15 * SECOND);
     }
 
     @Test
@@ -194,7 +211,7 @@ class ClaimHandleTest {
         for (int i = 0; i < RACE_ITERATIONS; i++) {
             Semaphore racePermits = new Semaphore(0);
             Map<ClaimKey, ClaimHandle> raceRegistry = new ConcurrentHashMap<>();
-            ClaimHandle handle = new ClaimHandle(item(i, 1), 0, MAX_PROCESSING_TIME, raceRegistry, racePermits);
+            ClaimHandle handle = new ClaimHandle(item(i, 1), 0, 0, MAX_PROCESSING_TIME, raceRegistry, racePermits);
             handle.register();
             CyclicBarrier start = new CyclicBarrier(3);
 
@@ -317,7 +334,7 @@ class ClaimHandleTest {
 
     @Test
     void toStringShowsOnlyTheIdAndToken() {
-        ClaimHandle handle = new ClaimHandle(new ClaimedItem(1, "op-secret", "payload-secret", 7), 0,
+        ClaimHandle handle = new ClaimHandle(new ClaimedItem(1, "op-secret", "payload-secret", 7), 0, 0,
                 MAX_PROCESSING_TIME, registry, permits);
 
         assertThat(handle).hasToString("ClaimHandle[id=1, token=7]");
@@ -328,7 +345,7 @@ class ClaimHandleTest {
     }
 
     private ClaimHandle handle(long id, long token, long claimedAt) {
-        return new ClaimHandle(item(id, token), claimedAt, MAX_PROCESSING_TIME, registry, permits);
+        return new ClaimHandle(item(id, token), claimedAt, claimedAt, MAX_PROCESSING_TIME, registry, permits);
     }
 
     private static ClaimedItem item(long id, long token) {

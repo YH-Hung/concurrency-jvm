@@ -1,6 +1,6 @@
 # db-work-queue — Design
 
-Date: 2026-09-21 (revision 11: 2026-09-26)
+Date: 2026-09-21 (revision 12: 2026-09-30)
 Status: Architecture accepted. Phase 1 gate passed (2026-09-25); approved for Phase 2.
 Production approval pending review of this revision. Every time value in §5.3 and §7 is a conditional target
 pending validation by the Phase 1 spike, review of the §5.3 timing argument,
@@ -311,8 +311,9 @@ held = concurrency`.
 (interrupting it; its `finally` returns held permits; a claim already committed and
 returned is still started) → wait up to `shutdown-grace` for the registry to empty, with
 renewal running → cancel all remaining handles → wait up to `shutdown-cancel-wait` → stop
-renewal, supervisor and sweeper → return. Nothing is released in Db2; leftover claims
-expire with their attempt consumed. A stopped runner is not started again.
+renewal, supervisor, sweeper and backlog sampler, waiting at most 1s for them in all →
+return. Nothing is released in Db2; leftover claims expire with their attempt consumed. A
+stopped runner is not started again.
 
 **`crash()`** (package-private, tests only): stop all loops and cancel all handles at once,
 no drain and no waiting.
@@ -545,14 +546,15 @@ time, retention is permanent for the namespace.
 | `WorkQueueProperties` | `@ConfigurationProperties("workqueue")`, including `db.*` timeouts. |
 | `TimingBudget`, `RenewalSchedule` | B1–B5 at startup; the renewal next-start function. |
 | `WorkItemRepository` | All SQL via `JdbcClient`, each operation in a timed `TransactionTemplate`: claim, renew, complete, retryOrFail, sweep, backlog sample, replay, revokeOwner, readNamespace. Only class that knows Db2 syntax. |
-| `ClaimedItem`, `ClaimKey`, `IdempotencyKey`, `RenewalResult` | Records: `(id, operationId, payload, claimToken)`, `(id, token)`, `(namespace, operationId)` with validation (§5.4); `RenewalResult(renewed, ended, lost)`, the disjoint sets one renewal round reports (§5.3). |
+| `ClaimedItem`, `ClaimKey`, `IdempotencyKey`, `RenewalResult`, `BacklogSample` | Records: `(id, operationId, payload, claimToken)`, `(id, token)`, `(namespace, operationId)` with validation (§5.4); `RenewalResult(renewed, ended, lost)`, the disjoint sets one renewal round reports (§5.3); `BacklogSample(pending, claimed, failed, expiredClaims, oldestPendingAge)`, one backlog sample (§9.6). |
 | `Diagnostics` | What the engine may log about a failure: the class names down its cause chain, with SQL codes, never a message (§5.4). |
 | `ClaimHandle` | One claim's lifecycle state (§5.2): permit ownership, `markRunning`, `cancel`, exactly-once `finish`. |
-| `QueueRunner` | Poll loop, renewal loop, supervisor, registry, permits, stop/crash. |
+| `QueueRunner` | Poll loop, renewal loop, supervisor, registry, permits, stop/crash; runs the `Sweeper` and the `BacklogSampler` on two more loops, which stop and `crash()` also end. Records what health and the meters read (§9.6). |
 | `ItemProcessor`, `Outcome` | One row, one call; persist the result with retries; returns `COMPLETED`, `RETRY_SCHEDULED`, `FAILED`, `FENCED`, `ABANDONED`, `INTERRUPTED`, `CANCELLED`. Never throws. |
 | `ExternalService`, `CallResult` | SPI (§5.4). |
 | `Sweeper` | Every `sweep-interval`: expired CLAIMED rows with `ATTEMPTS ≥ max` → FAILED with `CLAIM_TOKEN + 1` and `OWNER = NULL` (§5.1), in batches of `sweep-batch-size` (`FETCH FIRST :s ROWS ONLY`, `SKIP LOCKED DATA`), repeating while a batch is full. Idempotent; runs on every instance; concurrent sweepers skip each other's rows instead of waiting. |
-| `BacklogSampler` | Every `backlog-sample-interval`: one query for DB-wide gauges (§9.6). |
+| `BacklogSampler` | Every `backlog-sample-interval`: one query for DB-wide gauges (§9.6). The gauges read the latest successful sample. |
+| `WorkQueueMetrics` | Binds the §9.6 meters to the application's Micrometer registry; each reads the engine's state when scraped. |
 | `WorkQueueHealth` | Liveness and readiness contributors (§9.6). |
 | `SchemaCheck` | At startup: engine migration applied; `WORK_QUEUE_META.NAMESPACE` matches the §5.4 format and equals `workqueue.expected-namespace`; `CURRENT TIMEZONE = 0` (§5.1). Fails fast otherwise. Workers never run DDL. |
 | `WorkQueueAdmin`, `WorkQueueEndpoint` | Replay and revokeOwner (§9.7); actuator endpoint `workqueue` with read (status) and write operations. Write operations are disabled unless `workqueue.admin.write-enabled=true`. |
@@ -807,22 +809,26 @@ changing replica count.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `claims`, `claim.duration`, `claim.errors` | counter, timer, counter | claim operations (an empty claim counts as a success) |
-| `outcomes{outcome}` | counter | one per task end |
-| `call.duration{result=ok\|error\|timeout}` | timer | external calls |
+| `claims`, `claim.duration`, `claim.errors` | counter, timer, counter | claim operations that returned (an empty claim counts), every claim operation, and those that failed |
+| `outcomes{outcome}` | counter | one per task end; a task cancelled before its body ran ends `CANCELLED`; a body that threw has no outcome |
+| `call.duration{result=ok\|error\|timeout\|interrupted}` | timer | external calls: `ok` returned a result; `error` threw or returned none; `timeout` threw `TimeoutException`; `interrupted` threw `InterruptedException`, or the interrupt status was set when it returned or threw |
 | `renewal.duration`, `renewal.errors` | timer, counter | renewal rounds that ran |
-| `renewal.lag` | gauge | max over renewal-eligible claims of the time since that claim's last successful lease write (claim or renewal); **0 when there are none** |
+| `renewal.lag` | gauge | max over renewal-eligible claims of the time since that claim's last successful lease write (claim or renewal), counted from the start of the operation that wrote it: the write came no earlier (§5.3), so a lag of at most `L` means the lease has not run out; **0 when there are none** |
 | `claims.lost` | counter | claims reported lost by renewal (§5.3); a claim its own task ended after the round's snapshot is not lost |
-| `db.last_success_age` | gauge | time since any engine DB operation succeeded; kept fresh on idle instances by the poll loop's empty claims, the sweeper and the backlog sampler |
+| `db.last_success_age` | gauge | time since any engine DB operation succeeded (a claim, renewal round, sweep or backlog sample that returned), counted from the runner's creation until the first; kept fresh on idle instances by the poll loop's empty claims, the sweeper and the backlog sampler |
 | `inflight`, `permits.available`, `tasks.hung` | gauges | local capacity |
 | `registration.late` | counter | handles registered more than `registration-allowance` after their claim returned (a process pause the B2 proof does not cover) |
 | `invariant.violations` | counter | engine invariant breaches, e.g. a registry key collision |
-| `backlog{status}`, `backlog.oldest_pending_age`, `claims.expired` | gauges (sampled) | DB-wide; `claims.expired` = CLAIMED rows expired for more than one lease (nobody is picking them up) |
+| `backlog{status}`, `backlog.oldest_pending_age`, `claims.expired` | gauges (sampled) | DB-wide, from one uncommitted-read query (`WITH UR`) that never waits for row locks and may count work still in flight; `status` is `pending`, `claimed` or `failed` (DONE rows only accumulate, and no alert reads them); `backlog.oldest_pending_age` = how long the oldest PENDING row that is claimable now has been claimable, 0 if none (rows waiting out `retry-backoff` are not waiting for capacity); `claims.expired` = CLAIMED rows expired for more than one lease (nobody is picking them up); no value (NaN) until the first sample, then the latest successful sample |
+
+The timers are Micrometer `FunctionTimer`s: they report a count and a total time, so a rate
+and a mean, but no maximum or percentiles.
 
 **Health:**
 
 - Liveness DOWN when `tasks.hung ≥ hung-task-limit`, when `invariant.violations > 0`, or
-  when the poll, renewal or supervisor thread has died.
+  when the poll, renewal or supervisor thread has died: ended while the runner still ran it,
+  not by stop or `crash()`. A dead sweeper or backlog sampler loop is logged only.
 - Readiness DOWN during stop; before `SchemaCheck` passes; when `renewal.lag > L` (the
   instance is losing claims — only possible while it holds claims; a single failed round,
   which B2 tolerates, does not trip it); or when
@@ -953,7 +959,16 @@ not.
   - renewal: a claim reported lost is counted and cancelled; one its own task ended after
     the snapshot is neither;
   - a task that throws, even an `Error` → logged by id, token and class name only,
-    `finish()` once.
+    `finish()` once;
+  - the sweeper and the backlog sampler run every interval until stop or `crash()`;
+    `stop()` waits at most 1s in all for the loops that outlive the drain; a poll, renewal
+    or supervisor loop that dies is reported dead until stop, and loops that stop ended
+    are not.
+- `SweeperTest`: a pass sweeps full batches until one comes back short; a failed batch
+  ends the pass, logged by class names only, and keeps the earlier batches; an interrupted
+  pass stops after its current batch.
+- `WorkQueueMetricsTest`: every §9.6 meter is registered with its tags and reads the
+  engine's state when scraped; the backlog gauges have no value until the first sample.
 - `RenewalScheduleTest`: `next(s, e, ok)` for success, overrun and failure.
 - `TimingBudgetTest`: each of B1–B5 rejects a violating config and names itself;
   `I = 15s, W = 5s, d = 1s, G = 1s, L = 26s` is rejected by B2; `W = 18s` is rejected by
@@ -991,10 +1006,13 @@ not.
   `("a", "b:c")` is accepted; namespaces outside `^[a-z0-9][a-z0-9-]{0,31}$` and empty or
   over-long operation ids are rejected; for generated valid pairs, distinct pairs always
   give distinct `value()`s, and splitting `value()` at the first `:` recovers the pair.
-- `WorkQueueHealthTest` (fake clock): an idle instance with no claims stays ready for
-  10 × lease and reports `renewal.lag = 0`; one failed renewal round keeps readiness UP;
-  an eligible claim unrenewed for more than `L` → readiness DOWN; `db.last_success_age > db-staleness-limit` with no claims →
-  readiness DOWN; both recover.
+- `WorkQueueHealthTest` (fake clock, defaults): an idle instance with no claims stays ready
+  for 10 × lease and reports `renewal.lag = 0`; one failed renewal round keeps readiness UP,
+  even in B2's worst case (a lag of 74s under the 100s lease); an eligible claim unrenewed
+  for more than `L` → readiness DOWN; `db.last_success_age > db-staleness-limit` with no
+  claims → readiness DOWN; both recover, and a sweep or backlog sample also keeps Db2
+  fresh; readiness DOWN from the start of stop; liveness DOWN at `hung-task-limit`, after
+  an invariant violation, and when a watched loop dies.
 - `ItemProcessorTest`: each `Outcome`; 0 rows with this owner's committed write →
   success outcome, not `FENCED`; exactly one call; timeout passed through; never throws.
 - `SimulatedDownstreamTest`: repeat key returns the stored result; `RESPONSE_LOST`
@@ -1020,7 +1038,10 @@ not.
    - sweep bumps the token and clears the owner; the swept owner's late renew, complete and
      retryOrFail are fenced;
    - replay resets `ATTEMPTS` and keeps `CLAIM_TOKEN` and `OPERATION_ID`;
-   - revokeOwner bumps the token, clears the owner, and sets PENDING or FAILED by `ATTEMPTS`.
+   - revokeOwner bumps the token, clears the owner, and sets PENDING or FAILED by `ATTEMPTS`;
+   - the backlog sample counts PENDING, CLAIMED and FAILED rows but not DONE ones, the claims
+     expired for more than one lease, and the age of the oldest claimable PENDING row; it
+     does not wait for a row another transaction has locked, and counts that row's uncommitted state.
 3. `StaleCompletionIT` — A claims, expiry forced, B claims; A's renew reports lost, A's
    complete is fenced, B's result is stored.
 4. `QueryTimeoutIT` — a deliberately slow statement returns within `T_tx + 1s` with
@@ -1296,3 +1317,15 @@ and load validation.
 | Failures are logged by their diagnostics only (§5.4) | A message may carry business data, and a message or cause that throws would throw out of the log call. |
 | `QueueRunner` validates its intervals, graces and counts at startup | A zero `hung-grace` marked every cancelled task hung at once. |
 | §6 lists `RenewalResult` and `Diagnostics` | Both are engine components that revision 11 added (§5.3, §5.4), but the component table did not name them. |
+
+**Revision 12 (Phase 2d planning, `Sweeper`, metrics and health):**
+
+| Change | Reason |
+|---|---|
+| `renewal.lag` counts from the start of the operation that wrote the lease | The write lands no earlier (§5.3), so a lag of at most `L` means the lease has not run out. `claimedAt` is up to `W` later and would understate the lag. |
+| `db.last_success_age` counts from the runner's creation until the first success | "Time since the last success" had no value before one. |
+| `backlog{status}` covers `pending`, `claimed` and `failed`; `backlog.oldest_pending_age` measures claimable PENDING rows from `AVAILABLE_AT`; the backlog gauges have no value until the first sample and keep the latest successful one | DONE rows only accumulate and no alert reads them, and counting them on every sample grows with the table. A row waiting out `retry-backoff` is not waiting for capacity. |
+| The backlog sample is an uncommitted read (`WITH UR`) | A sample that waited behind a claim's row locks would run into `T_lock`. The default isolation avoids that wait only while the database's `cur_commit` setting is on, and gauges tolerate counting work still in flight. |
+| `call.duration` adds `result=interrupted`; `outcomes` counts a task cancelled before its body ran as `CANCELLED` | An interrupted call is neither an error nor a timeout, and a cancelled task still ends. |
+| The sweeper and the backlog sampler run on loops of `QueueRunner`; stop ends them with renewal and the supervisor, waiting at most 1s in all | They stop with the instance, `crash()` included. Waiting up to 1s for each of the four loops in turn could take 4s of E2's 5s margin. |
+| A dead loop is one that ended while the runner still ran it | The loops that stop ends must not turn liveness DOWN during a graceful stop. |

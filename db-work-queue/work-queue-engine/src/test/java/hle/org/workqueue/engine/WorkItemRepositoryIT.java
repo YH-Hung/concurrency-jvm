@@ -469,6 +469,73 @@ class WorkItemRepositoryIT {
     }
 
     @Test
+    void sampleBacklogCountsTheUnfinishedRowsTheExpiredClaimsAndTheOldestClaimablePendingRow() {
+        long oldest = rows.insert();
+        rows.setAvailableAt(oldest, -120);
+        long newer = rows.insert();
+        rows.setAvailableAt(newer, -30);
+        long backingOff = rows.insert();
+        rows.setAvailableAt(backingOff, 60);                 // PENDING in retry-backoff: not waiting on capacity
+        long live = rows.insert();
+        rows.setClaim(live, "owner-a", 1, 1, 20);
+        long recentlyExpired = rows.insert();
+        rows.setClaim(recentlyExpired, "owner-b", 1, 1, -10);   // expired less than one lease (30s) ago
+        long abandoned = rows.insert();
+        rows.setClaim(abandoned, "owner-c", 1, 1, -31);         // expired more than one lease ago
+        long failed = rows.insert();
+        rows.setStatus(failed, "FAILED");
+        long done = rows.insert();
+        rows.setStatus(done, "DONE");
+
+        BacklogSample sample = repository.sampleBacklog();
+
+        assertThat(sample.pending()).isEqualTo(3);
+        assertThat(sample.claimed()).isEqualTo(3);
+        assertThat(sample.failed()).isEqualTo(1);
+        assertThat(sample.expiredClaims()).isEqualTo(1);
+        assertThat(sample.oldestPendingAge()).isBetween(Duration.ofSeconds(120), Duration.ofSeconds(125));
+    }
+
+    @Test
+    void sampleBacklogOfAnEmptyQueueIsAllZero() {
+        long done = rows.insert();
+        rows.setStatus(done, "DONE");
+        long waiting = rows.insert();
+        rows.setAvailableAt(waiting, 60);
+
+        assertThat(repository.sampleBacklog()).isEqualTo(new BacklogSample(1, 0, 0, 0, Duration.ZERO));
+    }
+
+    @Test
+    void sampleBacklogDoesNotWaitForRowsLockedByAnotherTransaction() throws Exception {
+        long locked = rows.insert();
+        CountDownLatch held = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<Integer> holder = executor.submit(() -> repository.inTransaction(jdbc -> {
+                int updated = jdbc.sql("UPDATE WORK_ITEM SET STATUS = 'CLAIMED', OWNER = 'owner-a' WHERE ID = :id")
+                        .param("id", locked)
+                        .update();
+                held.countDown();
+                await(release);
+                return updated;
+            }));
+            await(held);
+
+            long start = System.nanoTime();
+            BacklogSample sample = repository.sampleBacklog();
+
+            assertThat(Duration.ofNanos(System.nanoTime() - start)).as("no lock wait")
+                    .isLessThan(Duration.ofSeconds(1));
+            assertThat(sample.pending()).as("the uncommitted state").isZero();
+            assertThat(sample.claimed()).isEqualTo(1);
+            release.countDown();
+            assertThat(holder.get(10, TimeUnit.SECONDS)).isEqualTo(1);
+        }
+    }
+
+    @Test
     void replayDryRunCountsAndExecuteRequeuesKeepingTokenAndOperationId() {
         long matching = failedRow("downstream 503");
         long other = failedRow("bad payload");

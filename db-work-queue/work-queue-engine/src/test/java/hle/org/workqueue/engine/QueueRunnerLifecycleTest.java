@@ -16,6 +16,7 @@ import org.springframework.dao.DataAccessResourceFailureException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -27,12 +28,12 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
 import static hle.org.workqueue.engine.ScriptedRepository.Operation.COMPLETE;
 import static java.time.Duration.ofMillis;
+import static java.time.Duration.ofMinutes;
 import static java.time.Duration.ofSeconds;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -52,6 +53,8 @@ class QueueRunnerLifecycleTest {
      */
     private static final QueueRunner.Settings SETTINGS = QueueRunner.Settings.from(ItConfig.properties());
     private static final int CONCURRENCY = SETTINGS.concurrency();
+    /** The IT column with a minute between sweeps and between samples: those loops end soon only if interrupted. */
+    private static final QueueRunner.Settings MINUTE_PASSES = minutePasses();
     private static final DataAccessResourceFailureException UNREACHABLE =
             new DataAccessResourceFailureException("Db2 unreachable");
 
@@ -61,6 +64,8 @@ class QueueRunnerLifecycleTest {
     // Every handle that received a permit, registered or not, for the permit invariant.
     private final List<ClaimHandle> handles = new CopyOnWriteArrayList<>();
     private final Tasks tasks = new Tasks();
+    // Every loop thread a runner built by liveRunner() started, for the tests of its loops.
+    private final List<Thread> loops = new CopyOnWriteArrayList<>();
     private final Logger runnerLog = (Logger) LoggerFactory.getLogger(QueueRunner.class);
     private final ListAppender<ILoggingEvent> logged = new ListAppender<>();
     private QueueRunner runner = runner(tasks, recordingThreads(), now::get, new ConcurrentHashMap<>());
@@ -345,6 +350,7 @@ class QueueRunnerLifecycleTest {
 
         await().until(() -> handle(key(1, 1)).isEnded());
         assertThat(tasks.started()).isEmpty();
+        assertThat(runner.outcomes(Outcome.CANCELLED)).isEqualTo(1);
         await().untilAsserted(this::assertPermitInvariant);
     }
 
@@ -379,6 +385,7 @@ class QueueRunnerLifecycleTest {
             assertThat(event.getFormattedMessage()).isEqualTo("Task for claim ClaimHandle[id=1, token=1] of owner"
                     + " instance-a failed: java.lang.StackOverflowError");
         });
+        assertThat(Arrays.stream(Outcome.values()).mapToLong(runner::outcomes).sum()).as("no outcome").isZero();
     }
 
     @Test
@@ -614,6 +621,7 @@ class QueueRunnerLifecycleTest {
         now.addAndGet(2 * SECOND);
         runner.superviseOnce();
         assertThat(runner.hungTasks()).as("hung-task-limit is 1").isEqualTo(1);
+        assertThat(runner.hungTaskLimitReached()).isTrue();
 
         assertThat(runner.pollOnce()).as("the supervisor interval").isEqualTo(ofMillis(100));
         assertThat(repository.claimSizes()).containsExactly(4);
@@ -621,6 +629,7 @@ class QueueRunnerLifecycleTest {
 
         tasks.releaseAll();
         await().until(() -> handle(key(1, 1)).isEnded());
+        assertThat(runner.hungTaskLimitReached()).isFalse();
         runner.pollOnce();
         assertThat(repository.claimSizes()).containsExactly(4, 4);
     }
@@ -640,6 +649,171 @@ class QueueRunnerLifecycleTest {
         poll.get(10, SECONDS);
         assertThat(repository.claimSizes()).containsExactly(4, 1);
         assertThat(tasks.highWater()).isEqualTo(CONCURRENCY);
+    }
+
+    // ---- Sweeper and backlog sampler (spec §6) --------------------------------------------------------------
+
+    @Test
+    void aSweepPassSweepsBatchesOfTheSweepBatchSizeAndIsADbSuccess() {
+        now.addAndGet(5 * SECOND);
+        repository.thenSweep(100, 3);
+
+        assertThat(runner.sweepOnce()).isEqualTo(103);
+
+        assertThat(repository.sweepSizes()).containsExactly(100, 100);
+        assertThat(runner.dbLastSuccessAge()).isZero();
+    }
+
+    @Test
+    void theLatestBacklogSampleIsKeptAndIsADbSuccess() {
+        BacklogSample sample = new BacklogSample(12, 4, 1, 0, ofSeconds(30));
+        now.addAndGet(5 * SECOND);
+        assertThat(runner.backlog()).isNull();
+        repository.thenSample(sample);
+
+        assertThat(runner.sampleOnce()).isTrue();
+
+        assertThat(runner.backlog()).isEqualTo(sample);
+        assertThat(runner.dbLastSuccessAge()).isZero();
+    }
+
+    // ---- What health and the meters read (spec §9.6) ---------------------------------------------------------
+
+    @Test
+    void aClaimIsTimedAndCountedAndItsLeaseCountsFromTheClaimsStart() throws Exception {
+        long start = now.get();
+        repository.thenClaim(() -> {
+            now.addAndGet(3 * SECOND);   // the claim takes 3s
+            return List.of(item(1, 1));
+        });
+
+        runner.pollOnce();
+
+        assertThat(runner.claims()).isEqualTo(1);
+        assertThat(runner.claimErrors()).isZero();
+        assertThat(runner.claimTimes().count()).isEqualTo(1);
+        assertThat(runner.claimTimes().totalNanos()).isEqualTo(3 * SECOND);
+        assertThat(handle(key(1, 1)).leaseWrittenAt()).isEqualTo(start);
+        assertThat(runner.renewalLag()).isEqualTo(ofSeconds(3));
+    }
+
+    @Test
+    void aFailedClaimIsTimedAndCountedAsAnError() throws Exception {
+        repository.thenClaim(() -> {
+            now.addAndGet(2 * SECOND);
+            throw UNREACHABLE;
+        });
+
+        runner.pollOnce();
+
+        assertThat(runner.claims()).isZero();
+        assertThat(runner.claimErrors()).isEqualTo(1);
+        assertThat(runner.claimTimes().count()).isEqualTo(1);
+        assertThat(runner.claimTimes().totalNanos()).isEqualTo(2 * SECOND);
+    }
+
+    @Test
+    void theRenewalLagIgnoresEndedCancelledAndPastDeadlineClaims() throws Exception {
+        assertThat(runner.renewalLag()).as("no claims").isZero();
+        tasks.ignoreInterrupts();
+        claimAndStart(item(1, 1), item(2, 1), item(3, 1));
+        now.addAndGet(5 * SECOND);
+        tasks.release(key(1, 1));                    // claim 1 ends
+        await().until(() -> handle(key(1, 1)).isEnded());
+        repository.thenRenewLosing(key(2, 1));
+        runner.renewOnce();                          // claim 2 is lost: cancelled, but its task keeps running
+        now.addAndGet(20 * SECOND);                  // claim 3's deadline; no supervisor pass has cancelled it
+
+        assertThat(runner.renewalLag()).isZero();
+        assertThat(runner.inflight()).isEqualTo(2);
+    }
+
+    @Test
+    void aRoundThatRenewsAClaimRestartsItsLagFromTheRoundsStart() throws Exception {
+        claimAndStart(item(1, 1));
+        now.addAndGet(5 * SECOND);
+        repository.thenRenew(requested -> {
+            now.addAndGet(SECOND);   // the round takes a second
+            return new RenewalResult(requested, Set.of(), Set.of());
+        });
+
+        assertThat(runner.renewOnce()).isTrue();
+
+        assertThat(runner.renewalLag()).isEqualTo(ofSeconds(1));
+        assertThat(runner.renewalTimes().count()).isEqualTo(1);
+        assertThat(runner.renewalTimes().totalNanos()).isEqualTo(SECOND);
+        assertThat(runner.renewalErrors()).isZero();
+    }
+
+    @Test
+    void aClaimTheRoundDidNotRenewKeepsItsLag() throws Exception {
+        claimAndStart(item(1, 1), item(2, 1));
+        now.addAndGet(5 * SECOND);
+        repository.thenRenewEnded(key(2, 1));   // claim 2's task persisted after the snapshot and is still ending
+
+        runner.renewOnce();
+
+        assertThat(handle(key(1, 1)).leaseWrittenAt()).isEqualTo(now.get());
+        assertThat(runner.renewalLag()).isEqualTo(ofSeconds(5));
+    }
+
+    @Test
+    void aFailedRoundLeavesTheLagGrowingAndCountsAnError() throws Exception {
+        claimAndStart(item(1, 1));
+        now.addAndGet(5 * SECOND);
+        repository.thenRenew(requested -> {
+            now.addAndGet(SECOND);
+            throw UNREACHABLE;
+        });
+
+        assertThat(runner.renewOnce()).isFalse();
+
+        assertThat(runner.renewalLag()).isEqualTo(ofSeconds(6));
+        assertThat(runner.renewalErrors()).isEqualTo(1);
+        assertThat(runner.renewalTimes().count()).isEqualTo(1);
+        assertThat(runner.renewalTimes().totalNanos()).isEqualTo(SECOND);
+    }
+
+    @Test
+    void theDbAgeCountsFromCreationThenFromTheLastClaimOrRoundThatReturned() throws Exception {
+        now.addAndGet(5 * SECOND);
+        assertThat(runner.dbLastSuccessAge()).isEqualTo(ofSeconds(5));
+        runner.renewOnce();                          // skipped: nothing to renew
+        assertThat(runner.dbLastSuccessAge()).as("a skipped round is no DB success").isEqualTo(ofSeconds(5));
+        assertThat(runner.renewalTimes().count()).as("nor a round that ran").isZero();
+
+        runner.pollOnce();                           // an empty claim
+        assertThat(runner.dbLastSuccessAge()).isZero();
+
+        now.addAndGet(3 * SECOND);
+        repository.thenClaimThrow(UNREACHABLE);
+        runner.pollOnce();
+        assertThat(runner.dbLastSuccessAge()).isEqualTo(ofSeconds(3));
+
+        claimAndStart(item(1, 1));
+        now.addAndGet(2 * SECOND);
+        repository.thenRenewThrow(UNREACHABLE);
+        runner.renewOnce();
+        assertThat(runner.dbLastSuccessAge()).isEqualTo(ofSeconds(2));
+        runner.renewOnce();
+        assertThat(runner.dbLastSuccessAge()).isZero();
+    }
+
+    @Test
+    void everyTaskEndIsCountedByItsOutcome() throws Exception {
+        tasks.endWith(key(2, 1), Outcome.RETRY_SCHEDULED);
+        claimAndStart(item(1, 1), item(2, 1), item(3, 1));
+        repository.thenRenewLosing(key(3, 1));
+        runner.renewOnce();                          // claim 3 is cancelled: its task is interrupted
+
+        tasks.release(key(1, 1));
+        tasks.release(key(2, 1));
+        await().until(() -> handles.stream().allMatch(ClaimHandle::isEnded));
+
+        assertThat(runner.outcomes(Outcome.COMPLETED)).isEqualTo(1);
+        assertThat(runner.outcomes(Outcome.RETRY_SCHEDULED)).isEqualTo(1);
+        assertThat(runner.outcomes(Outcome.INTERRUPTED)).isEqualTo(1);
+        assertThat(runner.outcomes(Outcome.FAILED)).isZero();
     }
 
     // ---- start, stop and crash (spec §5.2) ------------------------------------------------------------------
@@ -709,10 +883,12 @@ class QueueRunnerLifecycleTest {
 
     @Test
     void crashCancelsEveryClaimAtOnceAndStopsTheLoops() throws Exception {
-        runner = runner(tasks, recordingThreads(), System::nanoTime, new ConcurrentHashMap<>());
+        runner = liveRunner(MINUTE_PASSES);
         repository.thenClaim(item(1, 1), item(2, 1));
         runner.start();
         await().until(() -> tasks.started().size() == 2);
+        // Past their first passes, the sweeper and sampler sleep for a minute: only crash()'s interrupt ends them.
+        await().until(() -> repository.sweepSizes().size() == 1 && repository.samples() == 1);
         long start = System.nanoTime();
 
         runner.crash();
@@ -723,6 +899,49 @@ class QueueRunnerLifecycleTest {
         int claims = repository.claimSizes().size();
         await().during(ofMillis(300)).atMost(ofSeconds(2))
                 .until(() -> repository.claimSizes().size() == claims);
+        assertThat(loops).hasSize(5);
+        await().atMost(ofSeconds(5)).until(() -> loops.stream().noneMatch(Thread::isAlive));
+    }
+
+    @Test
+    void theSweeperAndTheBacklogSamplerRunEveryIntervalUntilStop() {
+        runner = liveRunner();
+
+        runner.start();
+
+        await().atMost(ofSeconds(5)).until(() -> repository.sweepSizes().size() >= 2 && repository.samples() >= 2);
+        runner.stop();
+        assertThat(loops).extracting(Thread::getName).containsExactly("workqueue-poll", "workqueue-renewal",
+                "workqueue-supervisor", "workqueue-sweeper", "workqueue-backlog-sampler");
+        assertThat(loops).noneMatch(Thread::isAlive);
+    }
+
+    @Test
+    void stopWaitsForAllFourLoopsAfterThePollLoopWithinOneSecondInAll() {
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch sweeping = new CountDownLatch(1);
+        CountDownLatch sampling = new CountDownLatch(1);
+        repository.thenSweep(() -> {
+            sweeping.countDown();
+            awaitIgnoringInterrupts(release);
+            return 0;
+        }).thenSample(() -> {
+            sampling.countDown();
+            awaitIgnoringInterrupts(release);
+            return new BacklogSample(0, 0, 0, 0, Duration.ZERO);
+        });
+        runner = liveRunner();
+        runner.start();
+        awaitIgnoringInterrupts(sweeping);
+        awaitIgnoringInterrupts(sampling);
+        long start = System.nanoTime();
+
+        runner.stop();
+
+        assertThat(Duration.ofNanos(System.nanoTime() - start))
+                .as("one shared second, not one per loop").isBetween(ofSeconds(1), ofMillis(1500));
+        release.countDown();
+        await().until(() -> loops.stream().noneMatch(Thread::isAlive));
     }
 
     @Test
@@ -763,6 +982,65 @@ class QueueRunnerLifecycleTest {
             assertThat(event.getFormattedMessage())
                     .isEqualTo("Poll loop of owner instance-a died: java.lang.StackOverflowError");
         });
+        await().until(() -> runner.deadLoops().equals(List.of("poll")));
+    }
+
+    @Test
+    void aLoopThatDiesIsReportedDeadUntilTheRunnerStops() {
+        Set<String> dying = Set.of("workqueue-poll", "workqueue-renewal", "workqueue-supervisor");
+        runner = new QueueRunner(repository, tasks, OWNER, SETTINGS, recordingThreads(), System::nanoTime,
+                new ConcurrentHashMap<>() {
+                    @Override
+                    public Collection<ClaimHandle> values() {   // each of the three loops reads the registry
+                        if (dying.contains(Thread.currentThread().getName())) {
+                            throw new StackOverflowError();
+                        }
+                        return super.values();
+                    }
+                }, recordingLoops());
+
+        runner.start();
+
+        await().until(() -> runner.deadLoops().equals(List.of("poll", "renewal", "supervisor")));
+        runner.stop();
+        assertThat(runner.deadLoops()).isEmpty();
+    }
+
+    @Test
+    void loopsThatStopEndsAreNotDead() throws Exception {
+        runner = liveRunner();
+        repository.thenClaim(item(1, 1));
+        runner.start();
+        await().until(() -> tasks.started().size() == 1);
+        FutureTask<Void> stop = new FutureTask<>(runner::stop, null);
+        Thread.ofVirtual().start(stop);
+        Thread poll = loops.getFirst();
+        await().until(() -> runner.isStopping() && !poll.isAlive());   // stop drains the task with the poll loop ended
+
+        assertThat(runner.deadLoops()).isEmpty();
+
+        tasks.releaseAll();
+        stop.get(10, SECONDS);
+    }
+
+    @Test
+    void aSweeperOrBacklogSamplerLoopThatDiesIsLoggedByClassNameOnlyButNotReportedDead() {
+        repository.thenSweep(() -> {
+            throw new StackOverflowError("row of order-7:charge");
+        }).thenSample(() -> {
+            throw new StackOverflowError("row of order-7:charge");
+        });
+        runner = liveRunner();
+
+        runner.start();
+
+        await().until(() -> loops.size() == 5 && !loops.get(3).isAlive() && !loops.get(4).isAlive());
+        assertThat(runner.deadLoops()).as("liveness watches the poll, renewal and supervisor loops").isEmpty();
+        synchronized (logged) {
+            assertThat(logged.list).extracting(ILoggingEvent::getFormattedMessage).containsExactlyInAnyOrder(
+                    "Sweeper loop of owner instance-a died: java.lang.StackOverflowError",
+                    "Backlog sampler loop of owner instance-a died: java.lang.StackOverflowError");
+        }
     }
 
     @Test
@@ -774,16 +1052,13 @@ class QueueRunnerLifecycleTest {
             awaitIgnoringInterrupts(claimReturns);   // the claim commits and returns although start() interrupts it
             return List.of(item(1, 1));
         });
-        List<Thread> loops = new CopyOnWriteArrayList<>();
         runner = new QueueRunner(repository, tasks, OWNER, SETTINGS, recordingThreads(), System::nanoTime,
                 new ConcurrentHashMap<>(), (name, loop) -> {
                     if (name.equals("workqueue-renewal")) {
                         awaitIgnoringInterrupts(claiming);   // the poll loop is inside its claim
                         throw new OutOfMemoryError("unable to create thread");
                     }
-                    Thread thread = QueueRunner.VIRTUAL_LOOP_THREADS.start(name, loop);
-                    loops.add(thread);
-                    return thread;
+                    return recordingLoops().start(name, loop);
                 });
 
         assertThatThrownBy(runner::start).isInstanceOf(OutOfMemoryError.class);
@@ -796,6 +1071,30 @@ class QueueRunnerLifecycleTest {
         assertThat(loops.getFirst().join(ofSeconds(10))).as("the poll loop ended").isTrue();
         assertThat(runner.isRunning()).isFalse();
         assertThatThrownBy(runner::start).isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
+    void aLoopThreadThatFailsToStartLastEndsEveryLoopStartedBeforeIt() {
+        CountDownLatch sweeping = new CountDownLatch(1);
+        repository.thenSweep(() -> {
+            sweeping.countDown();
+            return 0;
+        });
+        runner = new QueueRunner(repository, tasks, OWNER, MINUTE_PASSES, recordingThreads(), System::nanoTime,
+                new ConcurrentHashMap<>(), (name, loop) -> {
+                    if (name.equals("workqueue-backlog-sampler")) {
+                        awaitIgnoringInterrupts(sweeping);   // the sweeper is in its first pass: only an interrupt ends it
+                        throw new OutOfMemoryError("unable to create thread");
+                    }
+                    return recordingLoops().start(name, loop);
+                });
+
+        assertThatThrownBy(runner::start).isInstanceOf(OutOfMemoryError.class);
+
+        assertThat(loops).extracting(Thread::getName)
+                .containsExactly("workqueue-poll", "workqueue-renewal", "workqueue-supervisor", "workqueue-sweeper");
+        await().atMost(ofSeconds(5)).until(() -> loops.stream().noneMatch(Thread::isAlive));
+        assertThat(runner.isRunning()).isFalse();
     }
 
     @Test
@@ -818,7 +1117,7 @@ class QueueRunnerLifecycleTest {
     void settingsComeFromTheProperties() {
         assertThat(QueueRunner.Settings.from(new WorkQueueProperties())).isEqualTo(new QueueRunner.Settings(16, 20,
                 ofSeconds(1), ofSeconds(30), ofSeconds(1), ofSeconds(15), ofSeconds(1), ofSeconds(120), ofSeconds(1),
-                ofSeconds(30), 4, ofSeconds(20), ofSeconds(5)));
+                ofSeconds(30), 4, ofSeconds(20), ofSeconds(5), ofSeconds(30), 100, ofSeconds(30)));
     }
 
     @Test
@@ -833,6 +1132,9 @@ class QueueRunnerLifecycleTest {
         invalid.put("hungGrace", properties -> properties.setHungGrace(ofSeconds(-1)));
         invalid.put("shutdownGrace", properties -> properties.setShutdownGrace(Duration.ZERO));
         invalid.put("shutdownCancelWait", properties -> properties.setShutdownCancelWait(Duration.ZERO));
+        invalid.put("sweepInterval", properties -> properties.setSweepInterval(Duration.ZERO));
+        invalid.put("sweepBatchSize", properties -> properties.setSweepBatchSize(0));
+        invalid.put("backlogSampleInterval", properties -> properties.setBacklogSampleInterval(Duration.ZERO));
 
         invalid.forEach((name, change) -> {
             WorkQueueProperties properties = ItConfig.properties();
@@ -867,6 +1169,32 @@ class QueueRunnerLifecycleTest {
     private QueueRunner runner(QueueRunner.Processor processor, QueueRunner.TaskThreads threads, LongSupplier clock,
                                ConcurrentMap<ClaimKey, ClaimHandle> registry) {
         return new QueueRunner(repository, processor, OWNER, SETTINGS, threads, clock, registry);
+    }
+
+    // A runner on the real clock whose loop threads are recorded.
+    private QueueRunner liveRunner() {
+        return liveRunner(SETTINGS);
+    }
+
+    private QueueRunner liveRunner(QueueRunner.Settings settings) {
+        return new QueueRunner(repository, tasks, OWNER, settings, recordingThreads(), System::nanoTime,
+                new ConcurrentHashMap<>(), recordingLoops());
+    }
+
+    private static QueueRunner.Settings minutePasses() {
+        WorkQueueProperties properties = ItConfig.properties();
+        properties.setSweepInterval(ofMinutes(1));
+        properties.setBacklogSampleInterval(ofMinutes(1));
+        return QueueRunner.Settings.from(properties);
+    }
+
+    // Production's loop threads, recorded in the order they start.
+    private QueueRunner.LoopThreads recordingLoops() {
+        return (name, loop) -> {
+            Thread thread = QueueRunner.VIRTUAL_LOOP_THREADS.start(name, loop);
+            loops.add(thread);
+            return thread;
+        };
     }
 
     // Production's virtual threads, recording every handle that receives a thread and with it a permit.
@@ -918,72 +1246,5 @@ class QueueRunnerLifecycleTest {
 
     private static ClaimKey key(long id, long token) {
         return new ClaimKey(id, token);
-    }
-
-    /**
-     * Tasks that run until released, then end with their scripted outcome (COMPLETED by default). An interrupt
-     * ends a task INTERRUPTED at once, unless the tasks ignore interrupts.
-     */
-    private static final class Tasks implements QueueRunner.Processor {
-
-        private final Map<ClaimKey, CountDownLatch> releases = new ConcurrentHashMap<>();
-        private final Map<ClaimKey, Outcome> outcomes = new ConcurrentHashMap<>();
-        private final List<ClaimKey> started = new CopyOnWriteArrayList<>();
-        private final AtomicInteger running = new AtomicInteger();
-        private final AtomicInteger highWater = new AtomicInteger();
-        private volatile boolean allReleased;
-        private volatile boolean ignoreInterrupts;
-
-        @Override
-        public Outcome process(ClaimedItem item, BooleanSupplier cancelled) {
-            started.add(item.key());
-            highWater.accumulateAndGet(running.incrementAndGet(), Math::max);
-            try {
-                CountDownLatch release = latch(item.key());
-                // releaseAll sets allReleased before it counts down the latches, so a task that misses the flag
-                // has its latch counted down.
-                while (!allReleased && release.getCount() > 0) {
-                    try {
-                        release.await();
-                    } catch (InterruptedException e) {
-                        if (!ignoreInterrupts) {
-                            return Outcome.INTERRUPTED;
-                        }
-                    }
-                }
-                return outcomes.getOrDefault(item.key(), Outcome.COMPLETED);
-            } finally {
-                running.decrementAndGet();
-            }
-        }
-
-        List<ClaimKey> started() {
-            return List.copyOf(started);
-        }
-
-        int highWater() {
-            return highWater.get();
-        }
-
-        void ignoreInterrupts() {
-            ignoreInterrupts = true;
-        }
-
-        void endWith(ClaimKey key, Outcome outcome) {
-            outcomes.put(key, outcome);
-        }
-
-        void release(ClaimKey key) {
-            latch(key).countDown();
-        }
-
-        void releaseAll() {
-            allReleased = true;
-            releases.values().forEach(CountDownLatch::countDown);
-        }
-
-        private CountDownLatch latch(ClaimKey key) {
-            return releases.computeIfAbsent(key, k -> new CountDownLatch(1));
-        }
     }
 }
