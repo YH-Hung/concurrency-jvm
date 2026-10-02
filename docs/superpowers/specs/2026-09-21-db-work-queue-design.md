@@ -225,8 +225,12 @@ Rules:
 ### 5.2 Task lifecycle contract
 
 Each claim is owned by exactly one `ClaimHandle`, keyed by `ClaimKey(id, token)`.
-`QueueRunner` is the only class that creates handles, starts their threads, and holds the
-registry `ConcurrentHashMap<ClaimKey, ClaimHandle>` and `Semaphore permits(concurrency)`.
+`ClaimExecution` creates handles, starts their task threads, and owns the registry
+`ConcurrentHashMap<ClaimKey, ClaimHandle>` and `Semaphore permits(concurrency)`.
+`EngineLoops` schedules its poll, renewal and DB-free supervisor commands on separate
+threads, plus sweeping and backlog sampling. `QueueRunner` composes instance lifecycle
+and read-only observations; it does not manipulate claim state. The
+[code-reading guide](../../../db-work-queue/docs/architecture.md) describes these boundaries.
 
 **Execution model.** Each claim runs on its own virtual thread started directly with
 `Thread.ofVirtual().unstarted(body)` — not through an `ExecutorService`. This removes two
@@ -247,7 +251,10 @@ receive the commit acknowledgement — the poll loop treats it as "nothing claim
 registers nothing and returns all held permits. Any rows that did commit are CLAIMED by
 this owner but unregistered, so they are never renewed and never called; they become
 eligible for recovery within one lease (§7) with that attempt consumed. The loop then
-backs off exponentially (cap `poll-backoff-max`).
+backs off exponentially (cap `poll-backoff-max`). `ClaimExecution.pollOnce()` also owns
+recovery from a handle/thread construction failure, after locally held permits have been
+returned. Both failure paths share one counter, reset after a returned repository claim
+and before task construction; construction failures do not increment `claim.errors`.
 
 **Lifecycle, in order:**
 
@@ -307,7 +314,7 @@ that ignores interruption. Deadline enforcement never waits on Db2.
 **Permit invariant** (asserted by tests): `permits.available + (handles not ended) +
 held = concurrency`.
 
-**Stop (`SmartLifecycle.stop`, on SIGTERM):** readiness DOWN → stop the poll loop
+**Stop (`QueueRunner`'s `SmartLifecycle.stop`, on SIGTERM):** readiness DOWN → stop the poll loop
 (interrupting it; its `finally` returns held permits; a claim already committed and
 returned is still started) → wait up to `shutdown-grace` for the registry to empty, with
 renewal running → cancel all remaining handles → wait up to `shutdown-cancel-wait` → stop
@@ -316,7 +323,9 @@ return. Nothing is released in Db2; leftover claims expire with their attempt co
 stopped runner is not started again.
 
 **`crash()`** (package-private, tests only): stop all loops and cancel all handles at once,
-no drain and no waiting.
+no drain and no waiting. `EngineLoops.abort()` publishes claim cancellation and
+interrupts loop threads before `QueueRunner` waits on its lifecycle lock. Partial loop
+startup failure is also rolled back inside `EngineLoops`, cancelling claims already in flight.
 
 **Cancelling a handle not yet registered.** The cancel step of stop and `crash()` first
 records its reason, then cancels every registered handle. The poll loop reads that reason
@@ -549,13 +558,17 @@ time, retention is permanent for the namespace.
 | `ClaimedItem`, `ClaimKey`, `IdempotencyKey`, `RenewalResult`, `BacklogSample` | Records: `(id, operationId, payload, claimToken)`, `(id, token)`, `(namespace, operationId)` with validation (§5.4); `RenewalResult(renewed, ended, lost)`, the disjoint sets one renewal round reports (§5.3); `BacklogSample(pending, claimed, failed, expiredClaims, oldestPendingAge)`, one backlog sample (§9.6). |
 | `Diagnostics` | What the engine may log about a failure: the class names down its cause chain, with SQL codes, never a message (§5.4). |
 | `ClaimHandle` | One claim's lifecycle state (§5.2): permit ownership, `markRunning`, `cancel`, exactly-once `finish`. |
-| `QueueRunner` | Poll loop, renewal loop, supervisor, registry, permits, stop/crash; runs the `Sweeper` and the `BacklogSampler` on two more loops, which stop and `crash()` also end. Records what health and the meters read (§9.6). |
+| `QueueRunner` | Instance lifecycle (start, stop, test-only crash), assembly, and `EngineSnapshot` composition. |
+| `ClaimExecution` | Active-claim protocol (§5.2–5.3): permits, registry, registration/cancellation gate, task startup/exit, polling recovery/backoff, renewal, DB-free supervision and execution summary. |
+| `EngineLoops` | Five independent loop threads, scheduling, partial-start rollback, interruption and shared join budgets. |
+| `EngineSettings` | Immutable validated runtime settings converted from `WorkQueueProperties`; no property/default changes. |
+| `EngineSnapshot`, `OperationStats.Totals` | Immutable observations (§9.6), including the configured hung-threshold decision; no mutable handles or business data. |
 | `ItemProcessor`, `Outcome` | One row, one call; persist the result with retries; returns `COMPLETED`, `RETRY_SCHEDULED`, `FAILED`, `FENCED`, `ABANDONED`, `INTERRUPTED`, `CANCELLED`. Never throws. |
 | `ExternalService`, `CallResult` | SPI (§5.4). |
 | `Sweeper` | Every `sweep-interval`: expired CLAIMED rows with `ATTEMPTS ≥ max` → FAILED with `CLAIM_TOKEN + 1` and `OWNER = NULL` (§5.1), in batches of `sweep-batch-size` (`FETCH FIRST :s ROWS ONLY`, `SKIP LOCKED DATA`), repeating while a batch is full. Idempotent; runs on every instance; concurrent sweepers skip each other's rows instead of waiting. |
 | `BacklogSampler` | Every `backlog-sample-interval`: one query for DB-wide gauges (§9.6). The gauges read the latest successful sample, which `backlog.sample_age` dates. |
-| `WorkQueueMetrics` | Binds the §9.6 meters to the application's Micrometer registry; each reads the engine's state when scraped. |
-| `WorkQueueHealth` | Liveness and readiness contributors (§9.6). |
+| `WorkQueueMetrics` | Binds the §9.6 meters to the application's Micrometer registry; callbacks retain suppliers and read fresh immutable engine/call summaries when scraped. |
+| `WorkQueueHealth` | Liveness and readiness contributors (§9.6), consuming a supplied `EngineSnapshot`. |
 | `SchemaCheck` | At startup: engine migration applied; `WORK_QUEUE_META.NAMESPACE` matches the §5.4 format and equals `workqueue.expected-namespace`; `CURRENT TIMEZONE = 0` (§5.1). Fails fast otherwise. Workers never run DDL. |
 | `WorkQueueAdmin`, `WorkQueueEndpoint` | Replay and revokeOwner (§9.7); actuator endpoint `workqueue` with read (status) and write operations. Write operations are disabled unless `workqueue.admin.write-enabled=true`. |
 | `WorkQueueAutoConfiguration` | Wires the above; fails startup if no `ExternalService` bean exists. |
@@ -607,7 +620,7 @@ time, retention is permanent for the namespace.
 
 The demo uses the production defaults, so its scenarios exercise the real budget.
 
-`QueueRunner` checks its own settings when it is constructed at startup: every interval,
+`EngineSettings` validates runtime settings at construction: every interval,
 grace and allowance it uses is positive, and `concurrency`, `claim-batch-size` and
 `hung-task-limit` are at least 1.
 
@@ -929,15 +942,17 @@ bounds are asserted with the formulas of §7 evaluated on the test's config.
 
 ### 11.1 Unit and lifecycle-race tests (no Db2)
 
-`QueueRunner` takes an injectable repository, processor, task-thread factory, clock and
-registry, so races are driven deterministically with latches; every scenario ends by
-asserting the permit invariant, counting every handle that received a permit, registered or
-not.
+`ClaimExecution` takes an injectable repository, processor, task-thread factory, clock
+and registry; `EngineLoops` takes the loop-start failure seam. A test-only `EngineFixture`
+assembles these owners for lifecycle tests. Races use deterministic latches; each claim
+scenario ends by asserting the permit invariant, counting every handle that received a
+permit, registered or not.
 
 - `ClaimHandleTest`: `finish()` exactly once under concurrent finish/cancel (10 000
   iterations released together by a barrier); value-aware removal; cancel never releases
   the permit.
-- `QueueRunnerLifecycleTest`:
+- `ClaimExecutionTest`, `EngineLoopsTest`, and `QueueRunnerLifecycleTest` retain the
+  following scenarios at their owning module or composition boundary:
   - **claim throws** → every held permit returned, nothing registered, backoff applied;
   - **uncertain claim outcome** (repository returns rows, then throws as if the commit
     acknowledgement was lost) → every held permit returned, nothing registered or renewed;
@@ -970,13 +985,25 @@ not.
     that stop ended are not;
   - `claim.rows` counts every row a claim returned, those beyond its permits included;
     a failed backlog sample is counted and its sample age keeps growing.
+- `PublicApiTest`, `EngineSettingsTest`: only the downstream SPI/value types, configuration
+  and admin selection filter are externally accessible; settings conversion and validation
+  retain defaults and IT values.
+- `EngineSnapshotTest`: collection/timing copies stay immutable, fresh observations advance,
+  monitoring returns during blocked DB work, one clock reading dates each snapshot across
+  wraparound, and limits 1, 2 and 4 agree with poll admission.
+- `ClaimExecutionTest`: construction recovery and later repository failures share exponential
+  backoff without double-counting `claim.errors`; a successful empty claim resets it.
+- `EngineLoopsTest`, `QueueRunnerLifecycleTest`: first/late startup failures roll back,
+  crash interrupts loops before waiting on startup's lifecycle lock, and blocked renewal
+  does not prevent supervisor cancellation.
 - `SweeperTest`: a pass sweeps full batches until one comes back short; a failed batch
   ends the pass, logged by class names only, and keeps the earlier batches; an interrupted
   pass stops after its current batch.
 - `WorkQueueMetricsTest`: every §9.6 meter is registered with its tags and reads the
   engine's state when scraped; the backlog gauges have no value until the first sample;
   while samples fail, the gauges keep the latest one and `backlog.sample_age` grows, though
-  a claim keeps `db.last_success_age` at 0.
+  a claim keeps `db.last_success_age` at 0; meters bound once keep observing later claims,
+  calls and samples, including after garbage collection of temporary binder references.
 - `RenewalScheduleTest`: `next(s, e, ok)` for success, overrun and failure.
 - `TimingBudgetTest`: each of B1–B5 rejects a violating config and names itself;
   `I = 15s, W = 5s, d = 1s, G = 1s, L = 26s` is rejected by B2; `W = 18s` is rejected by
@@ -1021,7 +1048,8 @@ not.
   claims → readiness DOWN; both recover, and a sweep or backlog sample also keeps Db2
   fresh; readiness DOWN from the start of stop; liveness DOWN at `hung-task-limit`, after
   an invariant violation, and when any loop dies, a dead sweeper or backlog sampler
-  included (readiness stays UP).
+  included (readiness stays UP); limits 1, 2 and 4 preserve the configured threshold and
+  report the actual hung count, and shutdown-ended loops leave liveness UP.
 - `ItemProcessorTest`: each `Outcome`; 0 rows with this owner's committed write →
   success outcome, not `FENCED`; exactly one call; timeout passed through; never throws.
 - `SimulatedDownstreamTest`: repeat key returns the stored result; `RESPONSE_LOST`
@@ -1346,3 +1374,17 @@ and load validation.
 | `backlog.sample_age` and `backlog.sample.errors`, and the BacklogSampleStale alert | The backlog gauges keep the latest successful sample, and claims keep `db.last_success_age` and readiness healthy while samples fail: an hour-old zero backlog looked current, and the alerts on the sampled gauges stayed silent. |
 | Liveness watches all five loops, not only poll, renewal and supervisor | Only a restart revives a dead loop. Without the sweeper, a single instance leaves exhausted claims CLAIMED indefinitely; without the sampler, the backlog gauges freeze. |
 | `claim.rows`; LostClaimsHigh divides `claims.lost` by it | `claims` counts claim operations, empty ones included, but `claims.lost` counts rows: one lost row of a 20-row batch read as 100%, not 5%, and empty polls diluted the ratio on a quiet instance. |
+
+
+**Revision 14 (approved deep-module refactor, 2026-10-03):**
+
+| Change | Reason |
+|---|---|
+| Active claims live in `ClaimExecution`; loop scheduling lives in `EngineLoops`; `QueueRunner` is lifecycle composition | Capacity and cancellation can be understood in one owner while the supervisor remains independent of blocked DB work. |
+| `EngineSettings` extracts the validated runtime settings; persistence, claim and timing implementation types become package-private | Keep the application interface narrow without reducing the production goals or changing configuration names/defaults. |
+| Health/metrics consume immutable engine and call summaries, with a configured hung-threshold decision and live supplier callbacks | Hide mutable execution state while retaining all meter, freshness and health semantics. |
+| Tests follow state ownership; add shared poll recovery/backoff, snapshot, non-default hung-limit and loop-startup regressions | Preserve controlled interleavings and behavioral evidence through the extraction. |
+| Add a concise architecture guide | Readers can follow ordinary processing before consulting timing proofs or SQL details. |
+
+Schema, SQL, fencing, idempotency, the five-loop execution model, timing formulas and targets,
+configuration defaults, meter names/tags and future Phase 2–5 approval gates remain unchanged.

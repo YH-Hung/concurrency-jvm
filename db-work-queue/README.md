@@ -1,6 +1,6 @@
 # db-work-queue
 
-Db2-backed work-queue engine. Design: [spec](../docs/superpowers/specs/2026-09-21-db-work-queue-design.md).
+Db2-backed work-queue engine. Start with the [code-reading guide](docs/architecture.md). Design: [spec](../docs/superpowers/specs/2026-09-21-db-work-queue-design.md).
 
 Status: Phase 1 gate green (spec §12: ITs 1–5); see [docs/claim-sql-spike.md](docs/claim-sql-spike.md). Phase 2 — runtime contracts — in progress: timing foundations (`TimingBudget`, `RenewalSchedule`, `LeaseSimulationTest`), `ClaimHandle`, `ItemProcessor`, `QueueRunner`, the `Sweeper`, the `BacklogSampler`, metrics and health done; the Db2 ITs 6–12 next.
 

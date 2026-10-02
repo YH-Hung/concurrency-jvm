@@ -72,8 +72,8 @@ final class ClaimExecution {
     // never takes lifecycle. It is reentrant, for a test that crashes the runner from inside a registration.
     private final Object registrationLock = new Object();
 
-    // Once set, every handle registered from then on is cancelled before its thread starts, so crash() and stop()
-    // also reach a handle the poll loop has transferred but not yet registered. Volatile for start()'s unlocked read.
+    // Once set, every handle registered from then on is cancelled before its thread starts, so abort() and cancelForShutdown()
+    // also reach a handle the poll loop has transferred but not yet registered.
     private volatile CancelReason cancelOnRegister;
 
     // Only the poll loop reads or writes this.

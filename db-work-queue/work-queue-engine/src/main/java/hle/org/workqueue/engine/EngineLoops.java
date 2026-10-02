@@ -153,8 +153,6 @@ final class EngineLoops {
         }
     }
 
-
-
     // ---- Renewal loop ----------------------------------------------------------------------------------------
 
     private void renewalLoop() {
@@ -179,8 +177,6 @@ final class EngineLoops {
         }
     }
 
-
-
     // ---- Supervisor ------------------------------------------------------------------------------------------
 
     private void supervisorLoop() {
@@ -199,8 +195,6 @@ final class EngineLoops {
             log.error("Supervisor loop of owner {} died: {}", owner, Diagnostics.describe(t));
         }
     }
-
-
 
     // ---- Sweeper and backlog sampler -------------------------------------------------------------------------
 
