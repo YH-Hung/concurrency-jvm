@@ -12,7 +12,7 @@ import static hle.org.workqueue.engine.Durations.seconds;
  * IllegalStateException that names every violated constraint; a budget exists only for a configuration
  * that passes, and reports the timing values the spec derives from it.
  */
-public final class TimingBudget {
+final class TimingBudget {
 
     private final LeaseTiming leaseTiming;
 

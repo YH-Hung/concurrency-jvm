@@ -10,7 +10,7 @@ import java.time.Duration;
  * @param interval   I, renew-interval
  * @param retryDelay d, renew-retry-delay
  */
-public record RenewalSchedule(Duration interval, Duration retryDelay) {
+record RenewalSchedule(Duration interval, Duration retryDelay) {
 
     public RenewalSchedule {
         Durations.requirePositive("interval", interval);

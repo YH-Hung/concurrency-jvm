@@ -13,7 +13,7 @@ import java.util.Objects;
  * @param expiredClaims    CLAIMED rows whose lease ended more than one lease ago: nobody is picking them up
  * @param oldestPendingAge how long the oldest PENDING row that is claimable now has been claimable; zero if none
  */
-public record BacklogSample(long pending, long claimed, long failed, long expiredClaims, Duration oldestPendingAge) {
+record BacklogSample(long pending, long claimed, long failed, long expiredClaims, Duration oldestPendingAge) {
 
     public BacklogSample {
         requireNotNegative("pending", pending);

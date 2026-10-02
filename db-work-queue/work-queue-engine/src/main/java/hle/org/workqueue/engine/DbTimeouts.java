@@ -15,7 +15,7 @@ import java.util.Objects;
  * @param read        T_read: any single round trip, including commit (JCC {@code blockingReadConnectionTimeout})
  * @param lockWait    T_lock: a row-lock wait (Db2 {@code CURRENT LOCK TIMEOUT})
  */
-public record DbTimeouts(Duration poolWait, Duration login, Duration transaction, Duration read, Duration lockWait) {
+record DbTimeouts(Duration poolWait, Duration login, Duration transaction, Duration read, Duration lockWait) {
 
     /** Hikari rejects connection and validation timeouts below 250ms. */
     private static final Duration HIKARI_MIN_TIMEOUT = Duration.ofMillis(250);

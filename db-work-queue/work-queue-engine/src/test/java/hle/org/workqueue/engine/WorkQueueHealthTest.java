@@ -41,7 +41,7 @@ class WorkQueueHealthTest {
     private final Tasks tasks = new Tasks();
     private final List<ClaimHandle> handles = new CopyOnWriteArrayList<>();
     private final QueueRunner runner = new QueueRunner(repository, tasks, "instance-a",
-            QueueRunner.Settings.from(DEFAULTS), (handle, body) -> {
+            EngineSettings.from(DEFAULTS), (handle, body) -> {
                 handles.add(handle);
                 return QueueRunner.VIRTUAL_THREADS.newThread(handle, body);
             }, now::get, new ConcurrentHashMap<>());

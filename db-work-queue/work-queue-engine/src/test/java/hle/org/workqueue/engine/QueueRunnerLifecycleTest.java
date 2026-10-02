@@ -51,10 +51,10 @@ class QueueRunnerLifecycleTest {
      * idle-poll-interval 100ms, poll-backoff-max 2s, renew-interval 1s, supervisor-interval 100ms, hung-grace 2s,
      * hung-task-limit 1, shutdown-grace 2s, shutdown-cancel-wait 1s.
      */
-    private static final QueueRunner.Settings SETTINGS = QueueRunner.Settings.from(ItConfig.properties());
+    private static final EngineSettings SETTINGS = EngineSettings.from(ItConfig.properties());
     private static final int CONCURRENCY = SETTINGS.concurrency();
     /** The IT column with a minute between sweeps and between samples: those loops end soon only if interrupted. */
-    private static final QueueRunner.Settings MINUTE_PASSES = minutePasses();
+    private static final EngineSettings MINUTE_PASSES = minutePasses();
     private static final DataAccessResourceFailureException UNREACHABLE =
             new DataAccessResourceFailureException("Db2 unreachable");
 
@@ -104,7 +104,7 @@ class QueueRunnerLifecycleTest {
     void aClaimAsksForNoMoreThanTheBatchSize() throws Exception {
         WorkQueueProperties properties = ItConfig.properties();
         properties.setClaimBatchSize(3);
-        runner = new QueueRunner(repository, tasks, OWNER, QueueRunner.Settings.from(properties), recordingThreads(),
+        runner = new QueueRunner(repository, tasks, OWNER, EngineSettings.from(properties), recordingThreads(),
                 now::get, new ConcurrentHashMap<>());
 
         runner.pollOnce();
@@ -1132,37 +1132,6 @@ class QueueRunnerLifecycleTest {
     // ---- Settings -------------------------------------------------------------------------------------------
 
     @Test
-    void settingsComeFromTheProperties() {
-        assertThat(QueueRunner.Settings.from(new WorkQueueProperties())).isEqualTo(new QueueRunner.Settings(16, 20,
-                ofSeconds(1), ofSeconds(30), ofSeconds(1), ofSeconds(15), ofSeconds(1), ofSeconds(120), ofSeconds(1),
-                ofSeconds(30), 4, ofSeconds(20), ofSeconds(5), ofSeconds(30), 100, ofSeconds(30)));
-    }
-
-    @Test
-    void settingsRejectANonPositiveDurationOrACountBelowOne() {
-        Map<String, Consumer<WorkQueueProperties>> invalid = new LinkedHashMap<>();
-        invalid.put("concurrency", properties -> properties.setConcurrency(0));
-        invalid.put("claimBatchSize", properties -> properties.setClaimBatchSize(0));
-        invalid.put("hungTaskLimit", properties -> properties.setHungTaskLimit(0));
-        invalid.put("idlePollInterval", properties -> properties.setIdlePollInterval(Duration.ZERO));
-        invalid.put("pollBackoffMax", properties -> properties.setPollBackoffMax(Duration.ZERO));
-        invalid.put("supervisorInterval", properties -> properties.setSupervisorInterval(Duration.ZERO));
-        invalid.put("hungGrace", properties -> properties.setHungGrace(ofSeconds(-1)));
-        invalid.put("shutdownGrace", properties -> properties.setShutdownGrace(Duration.ZERO));
-        invalid.put("shutdownCancelWait", properties -> properties.setShutdownCancelWait(Duration.ZERO));
-        invalid.put("sweepInterval", properties -> properties.setSweepInterval(Duration.ZERO));
-        invalid.put("sweepBatchSize", properties -> properties.setSweepBatchSize(0));
-        invalid.put("backlogSampleInterval", properties -> properties.setBacklogSampleInterval(Duration.ZERO));
-
-        invalid.forEach((name, change) -> {
-            WorkQueueProperties properties = ItConfig.properties();
-            change.accept(properties);
-            assertThatThrownBy(() -> QueueRunner.Settings.from(properties))
-                    .isInstanceOf(IllegalArgumentException.class).hasMessageContaining(name);
-        });
-    }
-
-    @Test
     void rejectsAnInvalidOwner() {
         assertThatThrownBy(() -> new QueueRunner(repository, tasks, " ", SETTINGS))
                 .isInstanceOf(IllegalArgumentException.class);
@@ -1194,16 +1163,16 @@ class QueueRunnerLifecycleTest {
         return liveRunner(SETTINGS);
     }
 
-    private QueueRunner liveRunner(QueueRunner.Settings settings) {
+    private QueueRunner liveRunner(EngineSettings settings) {
         return new QueueRunner(repository, tasks, OWNER, settings, recordingThreads(), System::nanoTime,
                 new ConcurrentHashMap<>(), recordingLoops());
     }
 
-    private static QueueRunner.Settings minutePasses() {
+    private static EngineSettings minutePasses() {
         WorkQueueProperties properties = ItConfig.properties();
         properties.setSweepInterval(ofMinutes(1));
         properties.setBacklogSampleInterval(ofMinutes(1));
-        return QueueRunner.Settings.from(properties);
+        return EngineSettings.from(properties);
     }
 
     // Production's loop threads, recorded in the order they start.

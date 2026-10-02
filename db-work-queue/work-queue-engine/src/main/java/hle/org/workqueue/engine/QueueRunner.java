@@ -31,49 +31,6 @@ import java.util.function.LongSupplier;
  */
 final class QueueRunner implements SmartLifecycle {
 
-    /** The settings the loops use; spec §6 describes each. */
-    record Settings(int concurrency, int claimBatchSize, Duration idlePollInterval, Duration pollBackoffMax,
-                    Duration registrationAllowance, Duration renewInterval, Duration renewRetryDelay,
-                    Duration maxProcessingTime, Duration supervisorInterval, Duration hungGrace, int hungTaskLimit,
-                    Duration shutdownGrace, Duration shutdownCancelWait, Duration sweepInterval, int sweepBatchSize,
-                    Duration backlogSampleInterval) {
-
-        Settings {
-            requireAtLeastOne("concurrency", concurrency);
-            requireAtLeastOne("claimBatchSize", claimBatchSize);
-            requireAtLeastOne("hungTaskLimit", hungTaskLimit);
-            requireAtLeastOne("sweepBatchSize", sweepBatchSize);
-            Durations.requirePositive("idlePollInterval", idlePollInterval);
-            Durations.requirePositive("pollBackoffMax", pollBackoffMax);
-            Durations.requirePositive("registrationAllowance", registrationAllowance);
-            Durations.requirePositive("renewInterval", renewInterval);
-            Durations.requirePositive("renewRetryDelay", renewRetryDelay);
-            Durations.requirePositive("maxProcessingTime", maxProcessingTime);
-            Durations.requirePositive("supervisorInterval", supervisorInterval);
-            Durations.requirePositive("hungGrace", hungGrace);
-            Durations.requirePositive("shutdownGrace", shutdownGrace);
-            Durations.requirePositive("shutdownCancelWait", shutdownCancelWait);
-            Durations.requirePositive("sweepInterval", sweepInterval);
-            Durations.requirePositive("backlogSampleInterval", backlogSampleInterval);
-        }
-
-        static Settings from(WorkQueueProperties properties) {
-            return new Settings(properties.getConcurrency(), properties.getClaimBatchSize(),
-                    properties.getIdlePollInterval(), properties.getPollBackoffMax(),
-                    properties.getRegistrationAllowance(), properties.getRenewInterval(),
-                    properties.getRenewRetryDelay(), properties.getMaxProcessingTime(),
-                    properties.getSupervisorInterval(), properties.getHungGrace(), properties.getHungTaskLimit(),
-                    properties.getShutdownGrace(), properties.getShutdownCancelWait(), properties.getSweepInterval(),
-                    properties.getSweepBatchSize(), properties.getBacklogSampleInterval());
-        }
-
-        private static void requireAtLeastOne(String name, int value) {
-            if (value < 1) {
-                throw new IllegalArgumentException(name + " must be at least 1: " + value);
-            }
-        }
-    }
-
     /** Processes one claimed row: {@link ItemProcessor#process} in production. */
     @FunctionalInterface
     interface Processor {
@@ -114,7 +71,7 @@ final class QueueRunner implements SmartLifecycle {
     private final WorkItemRepository repository;
     private final Processor processor;
     private final String owner;
-    private final Settings settings;
+    private final EngineSettings settings;
     private final TaskThreads taskThreads;
     private final LoopThreads loopThreads;
     private final LongSupplier clock;
@@ -165,18 +122,18 @@ final class QueueRunner implements SmartLifecycle {
     private Thread sweeperThread;
     private Thread samplerThread;
 
-    QueueRunner(WorkItemRepository repository, Processor processor, String owner, Settings settings) {
+    QueueRunner(WorkItemRepository repository, Processor processor, String owner, EngineSettings settings) {
         this(repository, processor, owner, settings, VIRTUAL_THREADS, System::nanoTime, new ConcurrentHashMap<>());
     }
 
     /** For tests: the task threads, the clock and the registry are injectable. */
-    QueueRunner(WorkItemRepository repository, Processor processor, String owner, Settings settings,
+    QueueRunner(WorkItemRepository repository, Processor processor, String owner, EngineSettings settings,
                 TaskThreads taskThreads, LongSupplier clock, ConcurrentMap<ClaimKey, ClaimHandle> registry) {
         this(repository, processor, owner, settings, taskThreads, clock, registry, VIRTUAL_LOOP_THREADS);
     }
 
     /** For tests of a loop thread that fails to start. */
-    QueueRunner(WorkItemRepository repository, Processor processor, String owner, Settings settings,
+    QueueRunner(WorkItemRepository repository, Processor processor, String owner, EngineSettings settings,
                 TaskThreads taskThreads, LongSupplier clock, ConcurrentMap<ClaimKey, ClaimHandle> registry,
                 LoopThreads loopThreads) {
         WorkItemRepository.requireOwner(owner);

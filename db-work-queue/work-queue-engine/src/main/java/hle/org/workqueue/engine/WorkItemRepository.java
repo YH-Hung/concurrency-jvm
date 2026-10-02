@@ -35,7 +35,7 @@ import java.util.function.Function;
  * transaction already bound to the thread; callers must not wrap them in their own transaction, because the
  * timing budget assumes one operation per transaction.
  */
-public class WorkItemRepository {
+class WorkItemRepository {
 
     /**
      * Queue settings the SQL needs.

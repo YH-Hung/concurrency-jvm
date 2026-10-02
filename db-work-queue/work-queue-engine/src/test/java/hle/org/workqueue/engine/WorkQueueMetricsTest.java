@@ -39,7 +39,7 @@ class WorkQueueMetricsTest {
     private final List<ClaimHandle> handles = new CopyOnWriteArrayList<>();
     private final AtomicBoolean registerLate = new AtomicBoolean();
     private final QueueRunner runner = new QueueRunner(repository, tasks, OWNER,
-            QueueRunner.Settings.from(ItConfig.properties()), (handle, body) -> {
+            EngineSettings.from(ItConfig.properties()), (handle, body) -> {
                 handles.add(handle);
                 if (registerLate.get()) {
                     now.addAndGet(SECOND);   // past registration-allowance (200ms)

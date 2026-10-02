@@ -4,7 +4,7 @@ package hle.org.workqueue.engine;
  * Outcome of a fenced persist, after the read-back (spec §6, ItemProcessor step 3). A persist whose
  * earlier attempt committed but lost its acknowledgement reports that attempt's outcome, not FENCED.
  */
-public enum PersistResult {
+enum PersistResult {
     /** The row is DONE with this claim's result. */
     DONE,
     /** The row is PENDING again, claimable after retry-backoff. */

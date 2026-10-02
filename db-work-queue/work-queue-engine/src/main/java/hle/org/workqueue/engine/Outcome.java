@@ -1,7 +1,7 @@
 package hle.org.workqueue.engine;
 
 /** How one claim's task ended (spec §6 ItemProcessor). */
-public enum Outcome {
+enum Outcome {
     /** The call returned and the row is DONE with its result. */
     COMPLETED,
     /** The call failed with attempts left: the row is PENDING again after retry-backoff. */

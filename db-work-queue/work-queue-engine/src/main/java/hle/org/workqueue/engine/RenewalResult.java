@@ -10,7 +10,7 @@ import java.util.Set;
  * The constructor rejects a claim in more than one set, so a broken repository fails the round instead of having
  * the runner cancel a claim it also reports renewed.
  */
-public record RenewalResult(Set<ClaimKey> renewed, Set<ClaimKey> ended, Set<ClaimKey> lost) {
+record RenewalResult(Set<ClaimKey> renewed, Set<ClaimKey> ended, Set<ClaimKey> lost) {
 
     static final RenewalResult NOTHING = new RenewalResult(Set.of(), Set.of(), Set.of());
 
