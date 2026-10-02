@@ -44,4 +44,3 @@ record EngineSettings(int concurrency, int claimBatchSize, Duration idlePollInte
         }
     }
 }
-
