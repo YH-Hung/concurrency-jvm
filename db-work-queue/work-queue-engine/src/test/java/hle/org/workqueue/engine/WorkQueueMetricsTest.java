@@ -38,7 +38,7 @@ class WorkQueueMetricsTest {
     private final Tasks tasks = new Tasks();
     private final List<ClaimHandle> handles = new CopyOnWriteArrayList<>();
     private final AtomicBoolean registerLate = new AtomicBoolean();
-    private final QueueRunner runner = new QueueRunner(repository, tasks, OWNER,
+    private final EngineFixture engine = new EngineFixture(repository, tasks, OWNER,
             EngineSettings.from(ItConfig.properties()), (handle, body) -> {
                 handles.add(handle);
                 if (registerLate.get()) {
@@ -46,6 +46,7 @@ class WorkQueueMetricsTest {
                 }
                 return ClaimExecution.VIRTUAL_THREADS.newThread(handle, body);
             }, now::get, new ConcurrentHashMap<>());
+    private final QueueRunner runner = engine.runner;
     private final ItemProcessor processor = new ItemProcessor(repository, (key, token, payload, timeout) -> {
         now.addAndGet(2 * SECOND);   // every call takes 2s
         return new CallResult("receipt");
@@ -93,9 +94,9 @@ class WorkQueueMetricsTest {
             throw UNREACHABLE;
         });
 
-        runner.pollOnce();
-        runner.pollOnce();
-        runner.pollOnce();   // unscripted: empty at once
+        engine.execution.pollOnce();
+        engine.execution.pollOnce();
+        engine.execution.pollOnce();   // unscripted: empty at once
 
         FunctionTimer claims = registry.get("workqueue.claim.duration").functionTimer();
         assertThat(claims.count()).isEqualTo(3);
@@ -116,8 +117,8 @@ class WorkQueueMetricsTest {
             throw UNREACHABLE;
         });
 
-        runner.renewOnce();
-        runner.renewOnce();   // two failed rounds, so renewal.errors (2) differs from claims (1)
+        engine.execution.renewOnce();
+        engine.execution.renewOnce();   // two failed rounds, so renewal.errors (2) differs from claims (1)
 
         FunctionTimer rounds = registry.get("workqueue.renewal.duration").functionTimer();
         assertThat(rounds.count()).isEqualTo(2);
@@ -161,9 +162,9 @@ class WorkQueueMetricsTest {
         assertThat(gauge("workqueue.tasks.hung")).isZero();
 
         now.addAndGet(25 * SECOND);
-        runner.superviseOnce();   // all three cancelled at their deadline
+        engine.execution.superviseOnce();   // all three cancelled at their deadline
         now.addAndGet(2 * SECOND);
-        runner.superviseOnce();   // all three hung
+        engine.execution.superviseOnce();   // all three hung
 
         assertThat(gauge("workqueue.tasks.hung")).isEqualTo(3);
     }
@@ -172,13 +173,13 @@ class WorkQueueMetricsTest {
     void countersReadTheRunner() throws Exception {
         claimAndStart(item(1), item(2));
         repository.thenClaim(item(1));   // the same claim again while it runs: a key collision
-        runner.pollOnce();
+        engine.execution.pollOnce();
         repository.thenRenewLosing(new ClaimKey(1, 1), new ClaimKey(2, 1));
-        runner.renewOnce();
+        engine.execution.renewOnce();
         await().until(() -> handles.stream().allMatch(ClaimHandle::isEnded));   // both interrupted
         registerLate.set(true);
         claimAndStart(item(3), item(4), item(5));
-        runner.pollOnce();   // an empty claim, so claims (4) differs from registration.late (3)
+        engine.execution.pollOnce();   // an empty claim, so claims (4) differs from registration.late (3)
 
         assertThat(counter("workqueue.invariant.violations")).isEqualTo(1);
         assertThat(counter("workqueue.claims.lost")).isEqualTo(2);
@@ -192,7 +193,7 @@ class WorkQueueMetricsTest {
         now.addAndGet(7 * SECOND);
         assertThat(registry.get("workqueue.db.last_success_age").timeGauge().value(SECONDS)).isEqualTo(7);
 
-        runner.pollOnce();
+        engine.execution.pollOnce();
 
         assertThat(registry.get("workqueue.db.last_success_age").timeGauge().value(SECONDS)).isZero();
     }
@@ -204,7 +205,7 @@ class WorkQueueMetricsTest {
         assertThat(registry.get("workqueue.backlog.oldest_pending_age").timeGauge().value(SECONDS)).isNaN();
 
         repository.thenSample(new BacklogSample(12, 4, 1, 2, ofSeconds(30)));
-        runner.sampleOnce();
+        engine.sampler.sampleOnce();
 
         assertThat(gauge("workqueue.backlog", "status", "pending")).isEqualTo(12);
         assertThat(gauge("workqueue.backlog", "status", "claimed")).isEqualTo(4);
@@ -219,12 +220,12 @@ class WorkQueueMetricsTest {
         assertThat(registry.get("workqueue.backlog.sample_age").timeGauge().value(SECONDS)).isEqualTo(4);
         repository.thenSample(new BacklogSample(0, 0, 0, 0, ofSeconds(0)))
                 .thenSampleThrow(UNREACHABLE).thenSampleThrow(UNREACHABLE);
-        runner.sampleOnce();
+        engine.sampler.sampleOnce();
 
         now.addAndGet(60 * SECOND);
-        runner.sampleOnce();
-        runner.sampleOnce();
-        runner.pollOnce();   // an empty claim returns
+        engine.sampler.sampleOnce();
+        engine.sampler.sampleOnce();
+        engine.execution.pollOnce();   // an empty claim returns
 
         assertThat(registry.get("workqueue.db.last_success_age").timeGauge().value(SECONDS)).isZero();
         assertThat(gauge("workqueue.backlog", "status", "pending")).as("the latest successful sample").isZero();
@@ -234,7 +235,7 @@ class WorkQueueMetricsTest {
 
     private void claimAndStart(ClaimedItem... items) throws InterruptedException {
         repository.thenClaim(items);
-        runner.pollOnce();
+        engine.execution.pollOnce();
         List<ClaimKey> keys = Arrays.stream(items).map(ClaimedItem::key).toList();
         await().until(() -> tasks.started().containsAll(keys));
     }

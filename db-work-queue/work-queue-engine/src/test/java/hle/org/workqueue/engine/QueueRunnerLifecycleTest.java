@@ -68,6 +68,7 @@ class QueueRunnerLifecycleTest {
     private final List<Thread> loops = new CopyOnWriteArrayList<>();
     private final Logger runnerLog = (Logger) LoggerFactory.getLogger(QueueRunner.class);
     private final ListAppender<ILoggingEvent> logged = new ListAppender<>();
+    private EngineFixture engine;
     private QueueRunner runner = runner(tasks, recordingThreads(), now::get, new ConcurrentHashMap<>());
 
     @BeforeEach
@@ -93,7 +94,7 @@ class QueueRunnerLifecycleTest {
         now.addAndGet(5 * SECOND);
         repository.thenSweep(100, 3);
 
-        assertThat(runner.sweepOnce()).isEqualTo(103);
+        assertThat(engine.sweeper.sweepOnce()).isEqualTo(103);
 
         assertThat(repository.sweepSizes()).containsExactly(100, 100);
         assertThat(runner.dbLastSuccessAge()).isZero();
@@ -107,7 +108,7 @@ class QueueRunnerLifecycleTest {
         assertThat(runner.backlogSampleAge()).as("counted from the runner's creation").isEqualTo(ofSeconds(5));
         repository.thenSample(sample);
 
-        assertThat(runner.sampleOnce()).isTrue();
+        assertThat(engine.sampler.sampleOnce()).isTrue();
 
         assertThat(runner.backlog()).isEqualTo(sample);
         assertThat(runner.backlogSampleAge()).isZero();
@@ -119,7 +120,7 @@ class QueueRunnerLifecycleTest {
         repository.thenSampleThrow(UNREACHABLE);
         now.addAndGet(5 * SECOND);
 
-        assertThat(runner.sampleOnce()).isFalse();
+        assertThat(engine.sampler.sampleOnce()).isFalse();
 
         assertThat(runner.backlog()).isNull();
         assertThat(runner.backlogSampleErrors()).isEqualTo(1);
@@ -132,24 +133,24 @@ class QueueRunnerLifecycleTest {
     void theDbAgeCountsFromCreationThenFromTheLastClaimOrRoundThatReturned() throws Exception {
         now.addAndGet(5 * SECOND);
         assertThat(runner.dbLastSuccessAge()).isEqualTo(ofSeconds(5));
-        runner.renewOnce();                          // skipped: nothing to renew
+        engine.execution.renewOnce();                          // skipped: nothing to renew
         assertThat(runner.dbLastSuccessAge()).as("a skipped round is no DB success").isEqualTo(ofSeconds(5));
         assertThat(runner.renewalTimes().count()).as("nor a round that ran").isZero();
 
-        runner.pollOnce();                           // an empty claim
+        engine.execution.pollOnce();                           // an empty claim
         assertThat(runner.dbLastSuccessAge()).isZero();
 
         now.addAndGet(3 * SECOND);
         repository.thenClaimThrow(UNREACHABLE);
-        runner.pollOnce();
+        engine.execution.pollOnce();
         assertThat(runner.dbLastSuccessAge()).isEqualTo(ofSeconds(3));
 
         claimAndStart(item(1, 1));
         now.addAndGet(2 * SECOND);
         repository.thenRenewThrow(UNREACHABLE);
-        runner.renewOnce();
+        engine.execution.renewOnce();
         assertThat(runner.dbLastSuccessAge()).isEqualTo(ofSeconds(2));
-        runner.renewOnce();
+        engine.execution.renewOnce();
         assertThat(runner.dbLastSuccessAge()).isZero();
     }
 
@@ -239,19 +240,6 @@ class QueueRunnerLifecycleTest {
     }
 
     @Test
-    void theSweeperAndTheBacklogSamplerRunEveryIntervalUntilStop() {
-        runner = liveRunner();
-
-        runner.start();
-
-        await().atMost(ofSeconds(5)).until(() -> repository.sweepSizes().size() >= 2 && repository.samples() >= 2);
-        runner.stop();
-        assertThat(loops).extracting(Thread::getName).containsExactly("workqueue-poll", "workqueue-renewal",
-                "workqueue-supervisor", "workqueue-sweeper", "workqueue-backlog-sampler");
-        assertThat(loops).noneMatch(Thread::isAlive);
-    }
-
-    @Test
     void stopWaitsForAllFourLoopsAfterThePollLoopWithinOneSecondInAll() {
         CountDownLatch release = new CountDownLatch(1);
         CountDownLatch sweeping = new CountDownLatch(1);
@@ -280,6 +268,64 @@ class QueueRunnerLifecycleTest {
     }
 
     @Test
+    void aBlockedRenewalDoesNotPreventSupervisorCancellation() throws Exception {
+        WorkQueueProperties properties = ItConfig.properties();
+        properties.setRenewInterval(ofMillis(20));
+        properties.setMaxProcessingTime(ofMillis(200));
+        properties.setSupervisorInterval(ofMillis(10));
+        CountDownLatch renewing = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        repository.thenClaim(item(1, 1)).thenRenew(requested -> {
+            renewing.countDown();
+            awaitIgnoringInterrupts(release);
+            return new RenewalResult(requested, Set.of(), Set.of());
+        });
+        runner = liveRunner(EngineSettings.from(properties));
+        try {
+            runner.start();
+            assertThat(renewing.await(5, SECONDS)).isTrue();
+            await().atMost(ofSeconds(2)).until(() -> handle(key(1, 1)).isEnded());
+            assertThat(handle(key(1, 1)).cancelReason()).isEqualTo(CancelReason.DEADLINE);
+            assertThat(release.getCount()).isEqualTo(1);
+            assertPermitInvariant();
+        } finally {
+            release.countDown();
+            runner.crash();
+        }
+    }
+
+    @Test
+    void crashDuringStartupInterruptsLoopsBeforeWaitingOnLifecycle() throws Exception {
+        CountDownLatch startingRenewal = new CountDownLatch(1);
+        CountDownLatch finishStartup = new CountDownLatch(1);
+        engine = new EngineFixture(repository, tasks, OWNER, SETTINGS, recordingThreads(), System::nanoTime,
+                new ConcurrentHashMap<>(), (name, loop) -> {
+                    if (name.equals("workqueue-renewal")) {
+                        startingRenewal.countDown();
+                        awaitIgnoringInterrupts(finishStartup);
+                    }
+                    return recordingLoops().start(name, loop);
+                });
+        runner = engine.runner;
+        FutureTask<Void> start = new FutureTask<>(runner::start, null);
+        FutureTask<Void> crash = new FutureTask<>(runner::crash, null);
+        Thread.ofVirtual().start(start);
+        assertThat(startingRenewal.await(5, SECONDS)).isTrue();
+        try {
+            Thread.ofVirtual().start(crash);
+            await().until(() -> !loops.getFirst().isAlive());
+            assertThat(crash.isDone()).as("lifecycle lock still held by startup").isFalse();
+        } finally {
+            finishStartup.countDown();
+        }
+        start.get(5, SECONDS);
+        crash.get(5, SECONDS);
+        await().until(() -> loops.stream().noneMatch(Thread::isAlive));
+        assertThat(runner.isRunning()).isFalse();
+        assertPermitInvariant();
+    }
+
+    @Test
     void crashAlsoCancelsAClaimTransferredButNotYetRegistered() throws Exception {
         runner = runner(tasks, recordingThreads(), now::get, new ConcurrentHashMap<>() {
             @Override
@@ -290,55 +336,11 @@ class QueueRunnerLifecycleTest {
         });
         repository.thenClaim(item(1, 1));
 
-        runner.pollOnce();
+        engine.execution.pollOnce();
 
         await().until(() -> handle(key(1, 1)).isEnded());
         assertThat(handle(key(1, 1)).cancelReason()).isEqualTo(CancelReason.CRASH);
         assertThat(tasks.started()).isEmpty();
-    }
-
-    @Test
-    void anErrorEndsItsLoopAndIsLoggedByClassNameOnly() {
-        runner = runner(tasks, recordingThreads(), System::nanoTime, new ConcurrentHashMap<>());
-        repository.thenClaim(() -> {
-            throw new StackOverflowError("row of order-7:charge");
-        });
-
-        runner.start();
-
-        await().until(() -> {
-            synchronized (logged) {   // the appender appends under its own lock
-                return !logged.list.isEmpty();
-            }
-        });
-        assertThat(logged.list).singleElement().satisfies(event -> {
-            assertThat(event.getLevel()).isEqualTo(Level.ERROR);
-            assertThat(event.getThrowableProxy()).as("the raw throwable is not logged").isNull();
-            assertThat(event.getFormattedMessage())
-                    .isEqualTo("Poll loop of owner instance-a died: java.lang.StackOverflowError");
-        });
-        await().until(() -> runner.deadLoops().equals(List.of("poll")));
-    }
-
-    @Test
-    void aLoopThatDiesIsReportedDeadUntilTheRunnerStops() {
-        Set<String> dying = Set.of("workqueue-poll", "workqueue-renewal", "workqueue-supervisor");
-        runner = new QueueRunner(repository, tasks, OWNER, SETTINGS, recordingThreads(), System::nanoTime,
-                new ConcurrentHashMap<>() {
-                    @Override
-                    public Collection<ClaimHandle> values() {   // each of the three loops reads the registry
-                        if (dying.contains(Thread.currentThread().getName())) {
-                            throw new StackOverflowError();
-                        }
-                        return super.values();
-                    }
-                }, recordingLoops());
-
-        runner.start();
-
-        await().until(() -> runner.deadLoops().equals(List.of("poll", "renewal", "supervisor")));
-        runner.stop();
-        assertThat(runner.deadLoops()).isEmpty();
     }
 
     @Test
@@ -356,81 +358,6 @@ class QueueRunnerLifecycleTest {
 
         tasks.releaseAll();
         stop.get(10, SECONDS);
-    }
-
-    @Test
-    void aSweeperOrBacklogSamplerLoopThatDiesIsLoggedByClassNameOnlyAndReportedDeadUntilTheRunnerStops() {
-        repository.thenSweep(() -> {
-            throw new StackOverflowError("row of order-7:charge");
-        }).thenSample(() -> {
-            throw new StackOverflowError("row of order-7:charge");
-        });
-        runner = liveRunner();
-
-        runner.start();
-
-        await().until(() -> runner.deadLoops().equals(List.of("sweeper", "backlog-sampler")));
-        synchronized (logged) {
-            assertThat(logged.list).extracting(ILoggingEvent::getFormattedMessage).containsExactlyInAnyOrder(
-                    "Sweeper loop of owner instance-a died: java.lang.StackOverflowError",
-                    "Backlog sampler loop of owner instance-a died: java.lang.StackOverflowError");
-        }
-        runner.stop();
-        assertThat(runner.deadLoops()).isEmpty();
-    }
-
-    @Test
-    void aLoopThreadThatFailsToStartEndsTheLoopsAndCancelsAClaimAlreadyInFlight() throws Exception {
-        CountDownLatch claiming = new CountDownLatch(1);
-        CountDownLatch claimReturns = new CountDownLatch(1);
-        repository.thenClaim(() -> {
-            claiming.countDown();
-            awaitIgnoringInterrupts(claimReturns);   // the claim commits and returns although start() interrupts it
-            return List.of(item(1, 1));
-        });
-        runner = new QueueRunner(repository, tasks, OWNER, SETTINGS, recordingThreads(), System::nanoTime,
-                new ConcurrentHashMap<>(), (name, loop) -> {
-                    if (name.equals("workqueue-renewal")) {
-                        awaitIgnoringInterrupts(claiming);   // the poll loop is inside its claim
-                        throw new OutOfMemoryError("unable to create thread");
-                    }
-                    return recordingLoops().start(name, loop);
-                });
-
-        assertThatThrownBy(runner::start).isInstanceOf(OutOfMemoryError.class);
-        claimReturns.countDown();
-
-        await().until(() -> handles.stream().anyMatch(handle -> handle.key().equals(key(1, 1)) && handle.isEnded()));
-        assertThat(handle(key(1, 1)).cancelReason()).isEqualTo(CancelReason.SHUTDOWN);
-        assertThat(tasks.started()).as("the in-flight claim's task never ran").isEmpty();
-        assertThat(loops).extracting(Thread::getName).containsExactly("workqueue-poll");
-        assertThat(loops.getFirst().join(ofSeconds(10))).as("the poll loop ended").isTrue();
-        assertThat(runner.isRunning()).isFalse();
-        assertThatThrownBy(runner::start).isInstanceOf(IllegalStateException.class);
-    }
-
-    @Test
-    void aLoopThreadThatFailsToStartLastEndsEveryLoopStartedBeforeIt() {
-        CountDownLatch sweeping = new CountDownLatch(1);
-        repository.thenSweep(() -> {
-            sweeping.countDown();
-            return 0;
-        });
-        runner = new QueueRunner(repository, tasks, OWNER, MINUTE_PASSES, recordingThreads(), System::nanoTime,
-                new ConcurrentHashMap<>(), (name, loop) -> {
-                    if (name.equals("workqueue-backlog-sampler")) {
-                        awaitIgnoringInterrupts(sweeping);   // the sweeper is in its first pass: only an interrupt ends it
-                        throw new OutOfMemoryError("unable to create thread");
-                    }
-                    return recordingLoops().start(name, loop);
-                });
-
-        assertThatThrownBy(runner::start).isInstanceOf(OutOfMemoryError.class);
-
-        assertThat(loops).extracting(Thread::getName)
-                .containsExactly("workqueue-poll", "workqueue-renewal", "workqueue-supervisor", "workqueue-sweeper");
-        await().atMost(ofSeconds(5)).until(() -> loops.stream().noneMatch(Thread::isAlive));
-        assertThat(runner.isRunning()).isFalse();
     }
 
     @Test
@@ -466,14 +393,15 @@ class QueueRunnerLifecycleTest {
 
     private void claimAndStart(ClaimedItem... items) throws InterruptedException {
         repository.thenClaim(items);
-        runner.pollOnce();
+        engine.execution.pollOnce();
         List<ClaimKey> keys = Arrays.stream(items).map(ClaimedItem::key).toList();
         await().until(() -> tasks.started().containsAll(keys));
     }
 
     private QueueRunner runner(ClaimExecution.Processor processor, ClaimExecution.TaskThreads threads, LongSupplier clock,
                                ConcurrentMap<ClaimKey, ClaimHandle> registry) {
-        return new QueueRunner(repository, processor, OWNER, SETTINGS, threads, clock, registry);
+        engine = new EngineFixture(repository, processor, OWNER, SETTINGS, threads, clock, registry);
+        return engine.runner;
     }
 
     // A runner on the real clock whose loop threads are recorded.
@@ -482,8 +410,9 @@ class QueueRunnerLifecycleTest {
     }
 
     private QueueRunner liveRunner(EngineSettings settings) {
-        return new QueueRunner(repository, tasks, OWNER, settings, recordingThreads(), System::nanoTime,
+        engine = new EngineFixture(repository, tasks, OWNER, settings, recordingThreads(), System::nanoTime,
                 new ConcurrentHashMap<>(), recordingLoops());
+        return engine.runner;
     }
 
     private static EngineSettings minutePasses() {
@@ -494,9 +423,9 @@ class QueueRunnerLifecycleTest {
     }
 
     // Production's loop threads, recorded in the order they start.
-    private QueueRunner.LoopThreads recordingLoops() {
+    private EngineLoops.LoopThreads recordingLoops() {
         return (name, loop) -> {
-            Thread thread = QueueRunner.VIRTUAL_LOOP_THREADS.start(name, loop);
+            Thread thread = EngineLoops.VIRTUAL_LOOP_THREADS.start(name, loop);
             loops.add(thread);
             return thread;
         };

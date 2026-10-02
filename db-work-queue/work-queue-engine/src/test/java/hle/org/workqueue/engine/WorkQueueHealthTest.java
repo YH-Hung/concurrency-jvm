@@ -40,11 +40,12 @@ class WorkQueueHealthTest {
     private final AtomicLong now = new AtomicLong(Long.MAX_VALUE - 5 * SECOND);
     private final Tasks tasks = new Tasks();
     private final List<ClaimHandle> handles = new CopyOnWriteArrayList<>();
-    private final QueueRunner runner = new QueueRunner(repository, tasks, "instance-a",
+    private final EngineFixture engine = new EngineFixture(repository, tasks, "instance-a",
             EngineSettings.from(DEFAULTS), (handle, body) -> {
                 handles.add(handle);
                 return ClaimExecution.VIRTUAL_THREADS.newThread(handle, body);
             }, now::get, new ConcurrentHashMap<>());
+    private final QueueRunner runner = engine.runner;
     private final WorkQueueHealth health = new WorkQueueHealth(runner, WorkQueueHealth.Settings.from(DEFAULTS));
 
     @AfterEach
@@ -60,8 +61,8 @@ class WorkQueueHealthTest {
     void anIdleInstanceWithNoClaimsStaysReadyForTenLeases() throws Exception {
         long end = now.get() + 10 * 100 * SECOND;
         while (end - now.get() > 0) {
-            Duration pause = runner.pollOnce();   // an empty claim
-            runner.renewOnce();                   // skipped: nothing to renew
+            Duration pause = engine.execution.pollOnce();   // an empty claim
+            engine.execution.renewOnce();                   // skipped: nothing to renew
             now.addAndGet(pause.toNanos());
 
             assertThat(health.readiness().getStatus()).isEqualTo(Status.UP);
@@ -78,14 +79,14 @@ class WorkQueueHealthTest {
             now.addAndGet(18 * SECOND);
             return List.of(item(1));
         });
-        runner.pollOnce();
+        engine.execution.pollOnce();
         await().until(() -> tasks.started().size() == 1);
         now.addAndGet(SECOND + 18 * SECOND);
         repository.thenRenew(requested -> {
             now.addAndGet(18 * SECOND);
             throw UNREACHABLE;
         });
-        assertThat(runner.renewOnce()).isFalse();
+        assertThat(engine.execution.renewOnce()).isFalse();
         assertThat(health.readiness().getStatus()).isEqualTo(Status.UP);
         now.addAndGet(SECOND);
         AtomicReference<Health> beforeTheRetryWrites = new AtomicReference<>();
@@ -95,7 +96,7 @@ class WorkQueueHealthTest {
             return new RenewalResult(requested, Set.of(), Set.of());
         });
 
-        assertThat(runner.renewOnce()).isTrue();
+        assertThat(engine.execution.renewOnce()).isTrue();
 
         assertThat(beforeTheRetryWrites.get().getStatus()).isEqualTo(Status.UP);
         assertThat(beforeTheRetryWrites.get().getDetails()).containsEntry("renewalLag", "74s");
@@ -106,11 +107,11 @@ class WorkQueueHealthTest {
     void aClaimUnrenewedForMoreThanALeaseTurnsReadinessDownUntilARoundRenewsIt() throws Exception {
         claimAndStart(item(1));
         now.addAndGet(50 * SECOND);
-        runner.pollOnce();                            // claims keep Db2 fresh while renewal fails
+        engine.execution.pollOnce();                            // claims keep Db2 fresh while renewal fails
         repository.thenRenewThrow(UNREACHABLE);
-        runner.renewOnce();
+        engine.execution.renewOnce();
         now.addAndGet(50 * SECOND);
-        runner.pollOnce();
+        engine.execution.pollOnce();
         assertThat(health.readiness().getStatus()).as("exactly one lease").isEqualTo(Status.UP);
 
         now.addAndGet(1);
@@ -118,7 +119,7 @@ class WorkQueueHealthTest {
         Health unready = health.readiness();
         assertThat(unready.getStatus()).isEqualTo(Status.DOWN);
         assertThat(unready.getDetails()).containsEntry("renewalLag", "100s").containsEntry("dbLastSuccessAge", "0s");
-        runner.renewOnce();
+        engine.execution.renewOnce();
         assertThat(health.readiness().getStatus()).isEqualTo(Status.UP);
     }
 
@@ -126,15 +127,15 @@ class WorkQueueHealthTest {
     void aStaleDbTurnsReadinessDownWithNoClaimsUntilAClaimReturns() throws Exception {
         repository.thenClaimThrow(UNREACHABLE).thenClaimThrow(UNREACHABLE);
         now.addAndGet(45 * SECOND);
-        runner.pollOnce();
+        engine.execution.pollOnce();
         now.addAndGet(45 * SECOND);
-        runner.pollOnce();
+        engine.execution.pollOnce();
         assertThat(health.readiness().getStatus()).as("exactly db-staleness-limit").isEqualTo(Status.UP);
 
         now.addAndGet(1);
 
         assertThat(health.readiness().getStatus()).isEqualTo(Status.DOWN);
-        runner.pollOnce();                            // an empty claim
+        engine.execution.pollOnce();                            // an empty claim
         assertThat(health.readiness().getStatus()).isEqualTo(Status.UP);
     }
 
@@ -142,12 +143,12 @@ class WorkQueueHealthTest {
     void aSweepOrABacklogSampleAlsoKeepsTheDbFresh() {
         now.addAndGet(91 * SECOND);
         assertThat(health.readiness().getStatus()).isEqualTo(Status.DOWN);
-        runner.sweepOnce();
+        engine.sweeper.sweepOnce();
         assertThat(health.readiness().getStatus()).isEqualTo(Status.UP);
 
         now.addAndGet(91 * SECOND);
         assertThat(health.readiness().getStatus()).isEqualTo(Status.DOWN);
-        runner.sampleOnce();
+        engine.sampler.sampleOnce();
         assertThat(health.readiness().getStatus()).isEqualTo(Status.UP);
     }
 
@@ -187,7 +188,7 @@ class WorkQueueHealthTest {
         claimAndStart(item(1));
         repository.thenClaim(item(1));   // the same claim again while it runs: a key collision
 
-        runner.pollOnce();
+        engine.execution.pollOnce();
 
         assertThat(health.liveness().getStatus()).isEqualTo(Status.DOWN);
         tasks.releaseAll();
@@ -201,10 +202,10 @@ class WorkQueueHealthTest {
         tasks.ignoreInterrupts();
         claimAndStart(item(1), item(2), item(3), item(4));
         now.addAndGet(120 * SECOND);
-        runner.superviseOnce();          // all four cancelled at their deadline
+        engine.execution.superviseOnce();          // all four cancelled at their deadline
         now.addAndGet(30 * SECOND);
 
-        runner.superviseOnce();          // all four hung: the limit
+        engine.execution.superviseOnce();          // all four hung: the limit
 
         assertThat(health.liveness().getStatus()).isEqualTo(Status.DOWN);
         assertThat(health.liveness().getDetails()).containsEntry("hungTasks", 4);
@@ -259,7 +260,7 @@ class WorkQueueHealthTest {
 
     private void claimAndStart(ClaimedItem... items) throws InterruptedException {
         repository.thenClaim(items);
-        runner.pollOnce();
+        engine.execution.pollOnce();
         List<ClaimKey> keys = Arrays.stream(items).map(ClaimedItem::key).toList();
         await().until(() -> tasks.started().containsAll(keys));
     }
