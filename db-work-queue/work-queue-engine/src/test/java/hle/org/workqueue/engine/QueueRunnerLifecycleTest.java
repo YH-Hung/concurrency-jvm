@@ -265,6 +265,7 @@ class QueueRunnerLifecycleTest {
         assertThat(handles).extracting(ClaimHandle::key)
                 .containsExactly(key(1, 1), key(2, 1), key(3, 1), key(4, 1));
         assertThat(runner.invariantViolations()).isEqualTo(1);
+        assertThat(runner.claimedRows()).as("every row the claim returned is CLAIMED").isEqualTo(5);
         assertThat(runner.availablePermits()).isZero();
         assertPermitInvariant();
         assertThat(logged.list).singleElement().satisfies(event -> {
@@ -669,12 +670,26 @@ class QueueRunnerLifecycleTest {
         BacklogSample sample = new BacklogSample(12, 4, 1, 0, ofSeconds(30));
         now.addAndGet(5 * SECOND);
         assertThat(runner.backlog()).isNull();
+        assertThat(runner.backlogSampleAge()).as("counted from the runner's creation").isEqualTo(ofSeconds(5));
         repository.thenSample(sample);
 
         assertThat(runner.sampleOnce()).isTrue();
 
         assertThat(runner.backlog()).isEqualTo(sample);
+        assertThat(runner.backlogSampleAge()).isZero();
         assertThat(runner.dbLastSuccessAge()).isZero();
+    }
+
+    @Test
+    void aFailedBacklogSampleIsCountedAndTheSampleAgeKeepsGrowing() {
+        repository.thenSampleThrow(UNREACHABLE);
+        now.addAndGet(5 * SECOND);
+
+        assertThat(runner.sampleOnce()).isFalse();
+
+        assertThat(runner.backlog()).isNull();
+        assertThat(runner.backlogSampleErrors()).isEqualTo(1);
+        assertThat(runner.backlogSampleAge()).isEqualTo(ofSeconds(5));
     }
 
     // ---- What health and the meters read (spec §9.6) ---------------------------------------------------------
@@ -684,12 +699,13 @@ class QueueRunnerLifecycleTest {
         long start = now.get();
         repository.thenClaim(() -> {
             now.addAndGet(3 * SECOND);   // the claim takes 3s
-            return List.of(item(1, 1));
+            return List.of(item(1, 1), item(2, 1));
         });
 
         runner.pollOnce();
 
         assertThat(runner.claims()).isEqualTo(1);
+        assertThat(runner.claimedRows()).isEqualTo(2);
         assertThat(runner.claimErrors()).isZero();
         assertThat(runner.claimTimes().count()).isEqualTo(1);
         assertThat(runner.claimTimes().totalNanos()).isEqualTo(3 * SECOND);
@@ -707,6 +723,7 @@ class QueueRunnerLifecycleTest {
         runner.pollOnce();
 
         assertThat(runner.claims()).isZero();
+        assertThat(runner.claimedRows()).isZero();
         assertThat(runner.claimErrors()).isEqualTo(1);
         assertThat(runner.claimTimes().count()).isEqualTo(1);
         assertThat(runner.claimTimes().totalNanos()).isEqualTo(2 * SECOND);
@@ -1024,7 +1041,7 @@ class QueueRunnerLifecycleTest {
     }
 
     @Test
-    void aSweeperOrBacklogSamplerLoopThatDiesIsLoggedByClassNameOnlyButNotReportedDead() {
+    void aSweeperOrBacklogSamplerLoopThatDiesIsLoggedByClassNameOnlyAndReportedDeadUntilTheRunnerStops() {
         repository.thenSweep(() -> {
             throw new StackOverflowError("row of order-7:charge");
         }).thenSample(() -> {
@@ -1034,13 +1051,14 @@ class QueueRunnerLifecycleTest {
 
         runner.start();
 
-        await().until(() -> loops.size() == 5 && !loops.get(3).isAlive() && !loops.get(4).isAlive());
-        assertThat(runner.deadLoops()).as("liveness watches the poll, renewal and supervisor loops").isEmpty();
+        await().until(() -> runner.deadLoops().equals(List.of("sweeper", "backlog-sampler")));
         synchronized (logged) {
             assertThat(logged.list).extracting(ILoggingEvent::getFormattedMessage).containsExactlyInAnyOrder(
                     "Sweeper loop of owner instance-a died: java.lang.StackOverflowError",
                     "Backlog sampler loop of owner instance-a died: java.lang.StackOverflowError");
         }
+        runner.stop();
+        assertThat(runner.deadLoops()).isEmpty();
     }
 
     @Test

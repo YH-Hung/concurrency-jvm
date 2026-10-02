@@ -68,13 +68,14 @@ class WorkQueueMetricsTest {
     void everyMeterOfTheSpecIsRegistered() {
         Set<String> names = registry.getMeters().stream().map(meter -> meter.getId().getName()).collect(toSet());
 
-        assertThat(names).containsExactlyInAnyOrder("workqueue.claims", "workqueue.claim.duration",
-                "workqueue.claim.errors", "workqueue.outcomes", "workqueue.call.duration",
-                "workqueue.renewal.duration", "workqueue.renewal.errors", "workqueue.renewal.lag",
-                "workqueue.claims.lost", "workqueue.db.last_success_age", "workqueue.inflight",
-                "workqueue.permits.available", "workqueue.tasks.hung", "workqueue.registration.late",
-                "workqueue.invariant.violations", "workqueue.backlog", "workqueue.backlog.oldest_pending_age",
-                "workqueue.claims.expired");
+        assertThat(names).containsExactlyInAnyOrder("workqueue.claims", "workqueue.claim.rows",
+                "workqueue.claim.duration", "workqueue.claim.errors", "workqueue.outcomes",
+                "workqueue.call.duration", "workqueue.renewal.duration", "workqueue.renewal.errors",
+                "workqueue.renewal.lag", "workqueue.claims.lost", "workqueue.db.last_success_age",
+                "workqueue.inflight", "workqueue.permits.available", "workqueue.tasks.hung",
+                "workqueue.registration.late", "workqueue.invariant.violations", "workqueue.backlog",
+                "workqueue.backlog.oldest_pending_age", "workqueue.claims.expired", "workqueue.backlog.sample_age",
+                "workqueue.backlog.sample.errors");
         assertThat(tagValues("workqueue.outcomes", "outcome")).containsExactlyInAnyOrder("completed",
                 "retry_scheduled", "failed", "fenced", "abandoned", "interrupted", "cancelled");
         assertThat(tagValues("workqueue.call.duration", "result"))
@@ -183,6 +184,7 @@ class WorkQueueMetricsTest {
         assertThat(counter("workqueue.claims.lost")).isEqualTo(2);
         assertThat(counter("workqueue.registration.late")).isEqualTo(3);
         assertThat(counter("workqueue.claims")).isEqualTo(4);
+        assertThat(counter("workqueue.claim.rows")).as("2 + 1 + 3 + 0 rows").isEqualTo(6);
     }
 
     @Test
@@ -209,6 +211,25 @@ class WorkQueueMetricsTest {
         assertThat(gauge("workqueue.backlog", "status", "failed")).isEqualTo(1);
         assertThat(gauge("workqueue.claims.expired")).isEqualTo(2);
         assertThat(registry.get("workqueue.backlog.oldest_pending_age").timeGauge().value(SECONDS)).isEqualTo(30);
+    }
+
+    @Test
+    void theSampleAgeGrowsWhileSamplesFailAlthoughClaimsKeepTheDbFresh() throws Exception {
+        now.addAndGet(4 * SECOND);
+        assertThat(registry.get("workqueue.backlog.sample_age").timeGauge().value(SECONDS)).isEqualTo(4);
+        repository.thenSample(new BacklogSample(0, 0, 0, 0, ofSeconds(0)))
+                .thenSampleThrow(UNREACHABLE).thenSampleThrow(UNREACHABLE);
+        runner.sampleOnce();
+
+        now.addAndGet(60 * SECOND);
+        runner.sampleOnce();
+        runner.sampleOnce();
+        runner.pollOnce();   // an empty claim returns
+
+        assertThat(registry.get("workqueue.db.last_success_age").timeGauge().value(SECONDS)).isZero();
+        assertThat(gauge("workqueue.backlog", "status", "pending")).as("the latest successful sample").isZero();
+        assertThat(registry.get("workqueue.backlog.sample_age").timeGauge().value(SECONDS)).isEqualTo(60);
+        assertThat(counter("workqueue.backlog.sample.errors")).isEqualTo(2);
     }
 
     private void claimAndStart(ClaimedItem... items) throws InterruptedException {

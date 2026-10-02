@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import static java.time.Duration.ofSeconds;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Spec §6 {@code BacklogSampler}: the gauges read its latest successful sample. */
+/** Spec §6 {@code BacklogSampler}: the gauges read its latest successful sample, and its age shows how old that is. */
 class BacklogSamplerTest {
 
     private static final long SECOND = 1_000_000_000L;
@@ -24,7 +24,7 @@ class BacklogSamplerTest {
     private final ScriptedRepository repository = new ScriptedRepository();
     private final AtomicLong now = new AtomicLong(Long.MAX_VALUE - 5 * SECOND);
     private final DbActivity db = new DbActivity(now::get);
-    private final BacklogSampler sampler = new BacklogSampler(repository, "instance-a", db);
+    private final BacklogSampler sampler = new BacklogSampler(repository, "instance-a", db, now::get);
     private final Logger samplerLog = (Logger) LoggerFactory.getLogger(BacklogSampler.class);
     private final ListAppender<ILoggingEvent> logged = new ListAppender<>();
 
@@ -42,6 +42,32 @@ class BacklogSamplerTest {
     @Test
     void thereIsNoSampleBeforeTheFirst() {
         assertThat(sampler.latest()).isNull();
+        assertThat(sampler.errors()).isZero();
+    }
+
+    @Test
+    void theSampleAgeCountsFromCreationThenFromTheLatestSuccessfulSample() {
+        now.addAndGet(5 * SECOND);
+        assertThat(sampler.age()).isEqualTo(ofSeconds(5));
+        repository.thenSample(SAMPLE).thenSampleThrow(new DataAccessResourceFailureException("Db2 unreachable"));
+
+        sampler.sampleOnce();
+        now.addAndGet(3 * SECOND);
+        assertThat(sampler.age()).isEqualTo(ofSeconds(3));
+        sampler.sampleOnce();   // fails: the age keeps growing
+        now.addAndGet(4 * SECOND);
+
+        assertThat(sampler.age()).isEqualTo(ofSeconds(7));
+    }
+
+    @Test
+    void otherDbSuccessesDoNotRefreshTheSampleAge() {
+        now.addAndGet(5 * SECOND);
+
+        db.succeeded();   // a claim, renewal round or sweep that returned
+
+        assertThat(db.lastSuccessAge()).isZero();
+        assertThat(sampler.age()).isEqualTo(ofSeconds(5));
     }
 
     @Test
@@ -65,6 +91,8 @@ class BacklogSamplerTest {
         assertThat(sampler.sampleOnce()).isFalse();
 
         assertThat(sampler.latest()).isEqualTo(SAMPLE);
+        assertThat(sampler.age()).isEqualTo(ofSeconds(5));
+        assertThat(sampler.errors()).isEqualTo(1);
         assertThat(db.lastSuccessAge()).isEqualTo(ofSeconds(5));
         assertThat(logged.list).singleElement().satisfies(event -> {
             assertThat(event.getLevel()).isEqualTo(Level.WARN);
@@ -81,5 +109,6 @@ class BacklogSamplerTest {
         assertThat(sampler.sampleOnce()).isFalse();
 
         assertThat(sampler.latest()).isNull();
+        assertThat(sampler.errors()).isEqualTo(1);
     }
 }

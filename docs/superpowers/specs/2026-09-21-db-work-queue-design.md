@@ -1,6 +1,6 @@
 # db-work-queue — Design
 
-Date: 2026-09-21 (revision 12: 2026-09-30)
+Date: 2026-09-21 (revision 13: 2026-10-02)
 Status: Architecture accepted. Phase 1 gate passed (2026-09-25); approved for Phase 2.
 Production approval pending review of this revision. Every time value in §5.3 and §7 is a conditional target
 pending validation by the Phase 1 spike, review of the §5.3 timing argument,
@@ -553,7 +553,7 @@ time, retention is permanent for the namespace.
 | `ItemProcessor`, `Outcome` | One row, one call; persist the result with retries; returns `COMPLETED`, `RETRY_SCHEDULED`, `FAILED`, `FENCED`, `ABANDONED`, `INTERRUPTED`, `CANCELLED`. Never throws. |
 | `ExternalService`, `CallResult` | SPI (§5.4). |
 | `Sweeper` | Every `sweep-interval`: expired CLAIMED rows with `ATTEMPTS ≥ max` → FAILED with `CLAIM_TOKEN + 1` and `OWNER = NULL` (§5.1), in batches of `sweep-batch-size` (`FETCH FIRST :s ROWS ONLY`, `SKIP LOCKED DATA`), repeating while a batch is full. Idempotent; runs on every instance; concurrent sweepers skip each other's rows instead of waiting. |
-| `BacklogSampler` | Every `backlog-sample-interval`: one query for DB-wide gauges (§9.6). The gauges read the latest successful sample. |
+| `BacklogSampler` | Every `backlog-sample-interval`: one query for DB-wide gauges (§9.6). The gauges read the latest successful sample, which `backlog.sample_age` dates. |
 | `WorkQueueMetrics` | Binds the §9.6 meters to the application's Micrometer registry; each reads the engine's state when scraped. |
 | `WorkQueueHealth` | Liveness and readiness contributors (§9.6). |
 | `SchemaCheck` | At startup: engine migration applied; `WORK_QUEUE_META.NAMESPACE` matches the §5.4 format and equals `workqueue.expected-namespace`; `CURRENT TIMEZONE = 0` (§5.1). Fails fast otherwise. Workers never run DDL. |
@@ -809,7 +809,7 @@ changing replica count.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `claims`, `claim.duration`, `claim.errors` | counter, timer, counter | claim operations that returned (an empty claim counts), every claim operation, and those that failed |
+| `claims`, `claim.rows`, `claim.duration`, `claim.errors` | counter, counter, timer, counter | claim operations that returned (an empty claim counts), the rows they returned, every claim operation, and those that failed |
 | `outcomes{outcome}` | counter | one per task end; a task cancelled before its body ran ends `CANCELLED`; a body that threw has no outcome |
 | `call.duration{result=ok\|error\|timeout\|interrupted}` | timer | external calls: `ok` returned a result; `error` threw or returned none; `timeout` threw `TimeoutException`; `interrupted` threw `InterruptedException`, or the interrupt status was set when it returned or threw |
 | `renewal.duration`, `renewal.errors` | timer, counter | renewal rounds that ran |
@@ -820,6 +820,7 @@ changing replica count.
 | `registration.late` | counter | handles registered more than `registration-allowance` after their claim returned (a process pause the B2 proof does not cover) |
 | `invariant.violations` | counter | engine invariant breaches, e.g. a registry key collision |
 | `backlog{status}`, `backlog.oldest_pending_age`, `claims.expired` | gauges (sampled) | DB-wide, from one uncommitted-read query (`WITH UR`) that never waits for row locks and may count work still in flight; `status` is `pending`, `claimed` or `failed` (DONE rows only accumulate, and no alert reads them); `backlog.oldest_pending_age` = how long the oldest PENDING row that is claimable now has been claimable, 0 if none (rows waiting out `retry-backoff` are not waiting for capacity); `claims.expired` = CLAIMED rows expired for more than one lease (nobody is picking them up); no value (NaN) until the first sample, then the latest successful sample |
+| `backlog.sample_age`, `backlog.sample.errors` | gauge, counter | time since the latest successful backlog sample, counted from the runner's creation until the first, and the samples that failed; claims, renewals and sweeps keep `db.last_success_age` fresh, not this |
 
 The timers are Micrometer `FunctionTimer`s: they report a count and a total time, so a rate
 and a mean, but no maximum or percentiles.
@@ -827,8 +828,10 @@ and a mean, but no maximum or percentiles.
 **Health:**
 
 - Liveness DOWN when `tasks.hung ≥ hung-task-limit`, when `invariant.violations > 0`, or
-  when the poll, renewal or supervisor thread has died: ended while the runner still ran it,
-  not by stop or `crash()`. A dead sweeper or backlog sampler loop is logged only.
+  when any of the five loops (poll, renewal, supervisor, sweeper, backlog sampler) has
+  died: ended while the runner still ran it, not by stop or `crash()`. Only a restart
+  revives a loop: without the sweeper, a single instance leaves exhausted claims CLAIMED,
+  and without the sampler the backlog gauges freeze.
 - Readiness DOWN during stop; before `SchemaCheck` passes; when `renewal.lag > L` (the
   instance is losing claims — only possible while it holds claims; a single failed round,
   which B2 tolerates, does not trip it); or when
@@ -840,12 +843,13 @@ and a mean, but no maximum or percentiles.
 | Alert | Condition | First action |
 |---|---|---|
 | BacklogStalled | pending > 0 and completed rate = 0 for 5m | check replicas, Db2, downstream |
-| ExpiredClaims | `claims.expired > 0` for 2 × lease | no live workers, or all hung |
+| ExpiredClaims | `claims.expired > 0` for 2 × lease | no live workers, all hung, or sweeps failing (exhausted claims stay CLAIMED until swept) |
 | FailedRowsRising | `backlog{status=failed}` increased in 15m | inspect `LAST_ERROR`, fix cause, replay |
 | HungTasks | `tasks.hung > 0` | downstream ignoring timeouts; stack traces in logs |
-| LostClaimsHigh | lost / claims > 1% over 15m | GC pauses, Db2 latency, or lease too short |
+| LostClaimsHigh | `claims.lost / claim.rows > 1%` over 15m (both count rows) | GC pauses, Db2 latency, or lease too short |
 | RenewalLagging | `renewal.lag > L / 2` for 1m | Db2 latency or connectivity (fires only while claims are held) |
 | DbUnreachable | `db.last_success_age > db-staleness-limit / 2` | Db2 connectivity (fires on idle instances too) |
+| BacklogSampleStale | `backlog.sample_age > 3 × backlog-sample-interval` | the sample query fails (`backlog.sample.errors`, logs) or its loop died (liveness); this instance's sampled gauges are stale meanwhile |
 | AbandonedClaims | abandoned rate > 0 for 10m | Db2 write failures |
 | RegistrationLate | `registration.late` increased | process pauses (GC, CPU starvation); lease budget at risk |
 | InvariantViolation | `invariant.violations > 0` | engine bug: capture logs; the instance restarts via liveness |
@@ -961,14 +965,18 @@ not.
   - a task that throws, even an `Error` → logged by id, token and class name only,
     `finish()` once;
   - the sweeper and the backlog sampler run every interval until stop or `crash()`;
-    `stop()` waits at most 1s in all for the loops that outlive the drain; a poll, renewal
-    or supervisor loop that dies is reported dead until stop, and loops that stop ended
-    are not.
+    `stop()` waits at most 1s in all for the loops that outlive the drain; any loop that
+    dies, the sweeper and backlog sampler included, is reported dead until stop, and loops
+    that stop ended are not;
+  - `claim.rows` counts every row a claim returned, those beyond its permits included;
+    a failed backlog sample is counted and its sample age keeps growing.
 - `SweeperTest`: a pass sweeps full batches until one comes back short; a failed batch
   ends the pass, logged by class names only, and keeps the earlier batches; an interrupted
   pass stops after its current batch.
 - `WorkQueueMetricsTest`: every §9.6 meter is registered with its tags and reads the
-  engine's state when scraped; the backlog gauges have no value until the first sample.
+  engine's state when scraped; the backlog gauges have no value until the first sample;
+  while samples fail, the gauges keep the latest one and `backlog.sample_age` grows, though
+  a claim keeps `db.last_success_age` at 0.
 - `RenewalScheduleTest`: `next(s, e, ok)` for success, overrun and failure.
 - `TimingBudgetTest`: each of B1–B5 rejects a violating config and names itself;
   `I = 15s, W = 5s, d = 1s, G = 1s, L = 26s` is rejected by B2; `W = 18s` is rejected by
@@ -1012,7 +1020,8 @@ not.
   for more than `L` → readiness DOWN; `db.last_success_age > db-staleness-limit` with no
   claims → readiness DOWN; both recover, and a sweep or backlog sample also keeps Db2
   fresh; readiness DOWN from the start of stop; liveness DOWN at `hung-task-limit`, after
-  an invariant violation, and when a watched loop dies.
+  an invariant violation, and when any loop dies, a dead sweeper or backlog sampler
+  included (readiness stays UP).
 - `ItemProcessorTest`: each `Outcome`; 0 rows with this owner's committed write →
   success outcome, not `FENCED`; exactly one call; timeout passed through; never throws.
 - `SimulatedDownstreamTest`: repeat key returns the stored result; `RESPONSE_LOST`
@@ -1329,3 +1338,11 @@ and load validation.
 | `call.duration` adds `result=interrupted`; `outcomes` counts a task cancelled before its body ran as `CANCELLED` | An interrupted call is neither an error nor a timeout, and a cancelled task still ends. |
 | The sweeper and the backlog sampler run on loops of `QueueRunner`; stop ends them with renewal and the supervisor, waiting at most 1s in all | They stop with the instance, `crash()` included. Waiting up to 1s for each of the four loops in turn could take 4s of E2's 5s margin. |
 | A dead loop is one that ended while the runner still ran it | The loops that stop ends must not turn liveness DOWN during a graceful stop. |
+
+**Revision 13 (Phase 2d code review):**
+
+| Change | Reason |
+|---|---|
+| `backlog.sample_age` and `backlog.sample.errors`, and the BacklogSampleStale alert | The backlog gauges keep the latest successful sample, and claims keep `db.last_success_age` and readiness healthy while samples fail: an hour-old zero backlog looked current, and the alerts on the sampled gauges stayed silent. |
+| Liveness watches all five loops, not only poll, renewal and supervisor | Only a restart revives a dead loop. Without the sweeper, a single instance leaves exhausted claims CLAIMED indefinitely; without the sampler, the backlog gauges freeze. |
+| `claim.rows`; LostClaimsHigh divides `claims.lost` by it | `claims` counts claim operations, empty ones included, but `claims.lost` counts rows: one lost row of a 20-row batch read as 100%, not 5%, and empty polls diluted the ratio on a quiet instance. |

@@ -130,6 +130,7 @@ final class QueueRunner implements SmartLifecycle {
     private final AtomicLong registrationsLate = new AtomicLong();
     private final AtomicLong claimsLost = new AtomicLong();
     private final AtomicLong claims = new AtomicLong();
+    private final AtomicLong claimedRows = new AtomicLong();
     private final AtomicLong claimErrors = new AtomicLong();
     private final OperationStats claimTimes = new OperationStats();
     private final AtomicLong renewalErrors = new AtomicLong();
@@ -191,7 +192,7 @@ final class QueueRunner implements SmartLifecycle {
         this.schedule = new RenewalSchedule(settings.renewInterval(), settings.renewRetryDelay());
         this.dbActivity = new DbActivity(clock);
         this.sweeper = new Sweeper(repository, owner, settings.sweepBatchSize(), dbActivity);
-        this.sampler = new BacklogSampler(repository, owner, dbActivity);
+        this.sampler = new BacklogSampler(repository, owner, dbActivity, clock);
         for (Outcome outcome : Outcome.values()) {
             outcomes.put(outcome, new AtomicLong());
         }
@@ -368,6 +369,7 @@ final class QueueRunner implements SmartLifecycle {
             long claimedAt = clock.getAsLong();
             claimTimes.record(claimedAt - claimStartedAt);
             claims.incrementAndGet();
+            claimedRows.addAndGet(claimed.size());
             dbActivity.succeeded();
             claimFailures = 0;
             if (claimed.size() > held) {
@@ -582,7 +584,7 @@ final class QueueRunner implements SmartLifecycle {
     }
 
     // A pass, then the interval, until stopped. A pass logs its own failures, so only an Error ends the loop; it is
-    // logged, and liveness does not watch these two loops (spec §9.6).
+    // logged, and deadLoops() reports it to liveness as it does the other three.
     private void passLoop(String name, BooleanSupplier active, Runnable pass, Duration interval) {
         try {
             while (active.getAsBoolean()) {
@@ -633,8 +635,10 @@ final class QueueRunner implements SmartLifecycle {
     }
 
     /**
-     * The loops liveness watches (spec §9.6) that ended while the runner still wanted them: an Error ended them, or
-     * an interrupt that was not stop()'s or crash()'s. Loops that stop() or crash() ended are not dead. Each check
+     * The loops (spec §9.6) that ended while the runner still wanted them: an Error ended them, or an interrupt that
+     * was not stop()'s or crash()'s. Loops that stop() or crash() ended are not dead. A restart is the only remedy
+     * for any of the five: without the sweeper, a single instance leaves exhausted claims CLAIMED; without the
+     * sampler, the backlog gauges stop changing. Each check
      * reads the thread before its run flag: a thread's end happens-before it is seen ended, and stop() and crash()
      * clear the flag before they interrupt, so a loop they ended always shows its flag cleared. Reading the flag
      * first could see it still set just before stop() cleared it and the loop ended.
@@ -643,7 +647,7 @@ final class QueueRunner implements SmartLifecycle {
         if (!running) {
             return List.of();
         }
-        List<String> dead = new ArrayList<>(3);
+        List<String> dead = new ArrayList<>(5);
         if (!pollThread.isAlive() && polling) {
             dead.add("poll");
         }
@@ -653,12 +657,27 @@ final class QueueRunner implements SmartLifecycle {
         if (!supervisorThread.isAlive() && supervising) {
             dead.add("supervisor");
         }
+        if (!sweeperThread.isAlive() && sweeping) {
+            dead.add("sweeper");
+        }
+        if (!samplerThread.isAlive() && sampling) {
+            dead.add("backlog-sampler");
+        }
         return dead;
     }
 
     /** The latest backlog sample (spec §9.6 backlog gauges), or null before the first. */
     BacklogSample backlog() {
         return sampler.latest();
+    }
+
+    /** Spec §9.6 {@code backlog.sample_age}: how old the sample the backlog gauges read is. */
+    Duration backlogSampleAge() {
+        return sampler.age();
+    }
+
+    long backlogSampleErrors() {
+        return sampler.errors();
     }
 
     long invariantViolations() {
@@ -676,6 +695,11 @@ final class QueueRunner implements SmartLifecycle {
     /** Claim operations that returned, with rows or without. */
     long claims() {
         return claims.get();
+    }
+
+    /** The rows those claim operations returned: each is a claim, which renewal may later report lost. */
+    long claimedRows() {
+        return claimedRows.get();
     }
 
     /** Claim operations that failed: their outcome is unknown. */

@@ -38,8 +38,8 @@ final class WorkQueueHealth {
     }
 
     /**
-     * DOWN when hung tasks reach hung-task-limit, after any invariant violation, or when the poll, renewal or
-     * supervisor loop has died: the orchestrator's restart is the remedy for each.
+     * DOWN when hung tasks reach hung-task-limit, after any invariant violation, or when any of the runner's five
+     * loops has died: the orchestrator's restart is the remedy for each.
      */
     Health liveness() {
         int hungTasks = runner.hungTasks();

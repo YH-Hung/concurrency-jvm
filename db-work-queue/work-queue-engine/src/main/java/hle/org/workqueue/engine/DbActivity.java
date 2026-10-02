@@ -8,7 +8,8 @@ import java.util.function.LongSupplier;
 /**
  * When an engine DB operation last succeeded (spec §9.6 {@code db.last_success_age}). The claims, renewal rounds,
  * sweeps and backlog samples that return report here; readiness turns DOWN once the age passes db-staleness-limit.
- * Times are readings of the runner's clock, compared overflow-safely.
+ * The BacklogSampler keeps a second one for its own samples ({@code backlog.sample_age}). Times are readings of the
+ * runner's clock, compared overflow-safely.
  */
 final class DbActivity {
 

@@ -225,6 +225,22 @@ class WorkQueueHealthTest {
         assertThat(health.liveness().getDetails()).containsEntry("deadLoops", List.of("poll"));
     }
 
+    @Test
+    void aDeadSweeperOrBacklogSamplerTurnsLivenessDownWhileTheInstanceStaysReady() {
+        repository.thenSweep(() -> {
+            throw new StackOverflowError();
+        }).thenSample(() -> {
+            throw new StackOverflowError();
+        });
+
+        runner.start();
+
+        await().until(() -> runner.deadLoops().size() == 2);
+        assertThat(health.liveness().getStatus()).isEqualTo(Status.DOWN);
+        assertThat(health.liveness().getDetails()).containsEntry("deadLoops", List.of("sweeper", "backlog-sampler"));
+        assertThat(health.readiness().getStatus()).isEqualTo(Status.UP);
+    }
+
     // ---- Settings -------------------------------------------------------------------------------------------
 
     @Test

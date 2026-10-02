@@ -17,8 +17,8 @@ import java.util.function.ToDoubleFunction;
  * The engine's Micrometer meters (spec §9.6), all named {@code workqueue.*}. Each one reads the runner's or the
  * processor's state when the registry is scraped, so no meter is on a task's path. The timers are FunctionTimers:
  * they report a count and a total time, so a rate and a mean, but no maximum or percentiles. The backlog gauges
- * report NaN until the first sample. Phase 3's auto-configuration registers this as a bean, which Spring Boot binds
- * to the application's registry.
+ * report NaN until the first sample, then the latest successful one, which {@code backlog.sample_age} dates. Phase 3's
+ * auto-configuration registers this as a bean, which Spring Boot binds to the application's registry.
  */
 final class WorkQueueMetrics implements MeterBinder {
 
@@ -34,6 +34,7 @@ final class WorkQueueMetrics implements MeterBinder {
     public void bindTo(MeterRegistry registry) {
         counter(registry, "workqueue.claims", "Claim operations that returned, an empty claim included",
                 QueueRunner::claims);
+        counter(registry, "workqueue.claim.rows", "Rows that claim operations returned", QueueRunner::claimedRows);
         timer(registry, "workqueue.claim.duration", "Claim operations, returned or failed", Tags.empty(),
                 runner.claimTimes());
         counter(registry, "workqueue.claim.errors", "Claim operations that failed", QueueRunner::claimErrors);
@@ -70,6 +71,10 @@ final class WorkQueueMetrics implements MeterBinder {
                 + " waited (sampled)", r -> sampled(r, sample -> sample.oldestPendingAge().toNanos()));
         gauge(registry, "workqueue.claims.expired", "CLAIMED rows expired for more than one lease (sampled)",
                 r -> sampled(r, BacklogSample::expiredClaims));
+        timeGauge(registry, "workqueue.backlog.sample_age", "Time since the latest successful backlog sample,"
+                + " which the sampled gauges read", r -> r.backlogSampleAge().toNanos());
+        counter(registry, "workqueue.backlog.sample.errors", "Backlog samples that failed",
+                QueueRunner::backlogSampleErrors);
     }
 
     private void counter(MeterRegistry registry, String name, String description,
