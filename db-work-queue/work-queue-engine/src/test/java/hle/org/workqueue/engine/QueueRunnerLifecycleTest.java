@@ -84,7 +84,7 @@ class QueueRunnerLifecycleTest {
         tasks.releaseAll();
         await().untilAsserted(() -> assertThat(handles).allMatch(ClaimHandle::isEnded));
         await().untilAsserted(this::assertPermitInvariant);
-        assertThat(runner.availablePermits()).isEqualTo(CONCURRENCY);
+        assertThat(runner.snapshot().execution().availablePermits()).isEqualTo(CONCURRENCY);
     }
 
     // ---- Poll loop and permits (spec §5.2 steps 1–3) ----------------------------------------------------------
@@ -97,22 +97,22 @@ class QueueRunnerLifecycleTest {
         assertThat(engine.sweeper.sweepOnce()).isEqualTo(103);
 
         assertThat(repository.sweepSizes()).containsExactly(100, 100);
-        assertThat(runner.dbLastSuccessAge()).isZero();
+        assertThat(runner.snapshot().dbLastSuccessAge()).isZero();
     }
 
     @Test
     void theLatestBacklogSampleIsKeptAndIsADbSuccess() {
         BacklogSample sample = new BacklogSample(12, 4, 1, 0, ofSeconds(30));
         now.addAndGet(5 * SECOND);
-        assertThat(runner.backlog()).isNull();
-        assertThat(runner.backlogSampleAge()).as("counted from the runner's creation").isEqualTo(ofSeconds(5));
+        assertThat(runner.snapshot().backlog().latest()).isNull();
+        assertThat(runner.snapshot().backlog().sampleAge()).as("counted from the runner's creation").isEqualTo(ofSeconds(5));
         repository.thenSample(sample);
 
         assertThat(engine.sampler.sampleOnce()).isTrue();
 
-        assertThat(runner.backlog()).isEqualTo(sample);
-        assertThat(runner.backlogSampleAge()).isZero();
-        assertThat(runner.dbLastSuccessAge()).isZero();
+        assertThat(runner.snapshot().backlog().latest()).isEqualTo(sample);
+        assertThat(runner.snapshot().backlog().sampleAge()).isZero();
+        assertThat(runner.snapshot().dbLastSuccessAge()).isZero();
     }
 
     @Test
@@ -122,9 +122,9 @@ class QueueRunnerLifecycleTest {
 
         assertThat(engine.sampler.sampleOnce()).isFalse();
 
-        assertThat(runner.backlog()).isNull();
-        assertThat(runner.backlogSampleErrors()).isEqualTo(1);
-        assertThat(runner.backlogSampleAge()).isEqualTo(ofSeconds(5));
+        assertThat(runner.snapshot().backlog().latest()).isNull();
+        assertThat(runner.snapshot().backlog().sampleErrors()).isEqualTo(1);
+        assertThat(runner.snapshot().backlog().sampleAge()).isEqualTo(ofSeconds(5));
     }
 
     // ---- What health and the meters read (spec §9.6) ---------------------------------------------------------
@@ -132,26 +132,26 @@ class QueueRunnerLifecycleTest {
     @Test
     void theDbAgeCountsFromCreationThenFromTheLastClaimOrRoundThatReturned() throws Exception {
         now.addAndGet(5 * SECOND);
-        assertThat(runner.dbLastSuccessAge()).isEqualTo(ofSeconds(5));
+        assertThat(runner.snapshot().dbLastSuccessAge()).isEqualTo(ofSeconds(5));
         engine.execution.renewOnce();                          // skipped: nothing to renew
-        assertThat(runner.dbLastSuccessAge()).as("a skipped round is no DB success").isEqualTo(ofSeconds(5));
-        assertThat(runner.renewalTimes().count()).as("nor a round that ran").isZero();
+        assertThat(runner.snapshot().dbLastSuccessAge()).as("a skipped round is no DB success").isEqualTo(ofSeconds(5));
+        assertThat(runner.snapshot().execution().renewalTimes().count()).as("nor a round that ran").isZero();
 
         engine.execution.pollOnce();                           // an empty claim
-        assertThat(runner.dbLastSuccessAge()).isZero();
+        assertThat(runner.snapshot().dbLastSuccessAge()).isZero();
 
         now.addAndGet(3 * SECOND);
         repository.thenClaimThrow(UNREACHABLE);
         engine.execution.pollOnce();
-        assertThat(runner.dbLastSuccessAge()).isEqualTo(ofSeconds(3));
+        assertThat(runner.snapshot().dbLastSuccessAge()).isEqualTo(ofSeconds(3));
 
         claimAndStart(item(1, 1));
         now.addAndGet(2 * SECOND);
         repository.thenRenewThrow(UNREACHABLE);
         engine.execution.renewOnce();
-        assertThat(runner.dbLastSuccessAge()).isEqualTo(ofSeconds(2));
+        assertThat(runner.snapshot().dbLastSuccessAge()).isEqualTo(ofSeconds(2));
         engine.execution.renewOnce();
-        assertThat(runner.dbLastSuccessAge()).isZero();
+        assertThat(runner.snapshot().dbLastSuccessAge()).isZero();
     }
 
     @Test
@@ -162,7 +162,7 @@ class QueueRunnerLifecycleTest {
         await().until(() -> tasks.started().size() == 2);
         FutureTask<Void> stop = new FutureTask<>(runner::stop, null);
         Thread.ofVirtual().start(stop);
-        await().until(runner::isStopping);
+        await().until(() -> runner.snapshot().runtime().stopping());
         int roundsBefore = repository.renewRequests().size();
         // stop() joins the poll loop before it drains, so claiming ends at once: at most one claim that was already
         // in flight lands after isStopping(), and it only restarts the 300ms window. A loop still idle-polling
@@ -214,7 +214,7 @@ class QueueRunnerLifecycleTest {
         assertThat(Duration.ofNanos(System.nanoTime() - start))
                 .as("shutdown-grace + shutdown-cancel-wait").isBetween(ofSeconds(3), ofSeconds(4));
         assertThat(handle(key(1, 1)).isEnded()).as("still running").isFalse();
-        assertThat(runner.availablePermits()).as("it keeps its permit").isEqualTo(CONCURRENCY - 1);
+        assertThat(runner.snapshot().execution().availablePermits()).as("it keeps its permit").isEqualTo(CONCURRENCY - 1);
     }
 
     @Test
@@ -352,9 +352,9 @@ class QueueRunnerLifecycleTest {
         FutureTask<Void> stop = new FutureTask<>(runner::stop, null);
         Thread.ofVirtual().start(stop);
         Thread poll = loops.getFirst();
-        await().until(() -> runner.isStopping() && !poll.isAlive());   // stop drains the task with the poll loop ended
+        await().until(() -> runner.snapshot().runtime().stopping() && !poll.isAlive());   // stop drains the task with the poll loop ended
 
-        assertThat(runner.deadLoops()).isEmpty();
+        assertThat(runner.snapshot().runtime().deadLoops()).isEmpty();
 
         tasks.releaseAll();
         stop.get(10, SECONDS);
@@ -387,7 +387,7 @@ class QueueRunnerLifecycleTest {
     /** Spec §5.2 with held = 0: call it only while no pollOnce is running. */
     private void assertPermitInvariant() {
         long notEnded = handles.stream().filter(handle -> !handle.isEnded()).count();
-        assertThat(runner.availablePermits() + notEnded).as("permits.available + handles not ended")
+        assertThat(runner.snapshot().execution().availablePermits() + notEnded).as("permits.available + handles not ended")
                 .isEqualTo(CONCURRENCY);
     }
 

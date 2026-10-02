@@ -47,6 +47,10 @@ final class BacklogSampler {
         }
     }
 
+    EngineSnapshot.Backlog snapshot(long now) {
+        return new EngineSnapshot.Backlog(latest, sampled.ageAt(now), errors.get());
+    }
+
     /** The latest successful sample, or null before the first. */
     BacklogSample latest() {
         return latest;

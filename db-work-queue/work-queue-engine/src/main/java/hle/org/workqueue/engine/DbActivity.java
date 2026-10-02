@@ -29,6 +29,10 @@ final class DbActivity {
     }
 
     Duration lastSuccessAge() {
-        return Duration.ofNanos(Math.max(0, clock.getAsLong() - lastSuccess.get()));
+        return ageAt(clock.getAsLong());
+    }
+
+    Duration ageAt(long now) {
+        return Duration.ofNanos(Math.max(0, now - lastSuccess.get()));
     }
 }

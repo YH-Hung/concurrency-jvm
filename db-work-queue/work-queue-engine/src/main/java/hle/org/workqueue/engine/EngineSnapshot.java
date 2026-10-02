@@ -24,5 +24,11 @@ record EngineSnapshot(Execution execution, Backlog backlog, Runtime runtime, Dur
         }
     }
 
-    enum CallStatus { OK, ERROR, TIMEOUT, INTERRUPTED }
+    /** External-call classification for call.duration{result} (spec §9.6). */
+    enum CallStatus {
+        OK,          // returned a result
+        ERROR,       // threw or returned no result
+        TIMEOUT,     // threw TimeoutException
+        INTERRUPTED  // InterruptedException or interrupt status set when the call ended
+    }
 }

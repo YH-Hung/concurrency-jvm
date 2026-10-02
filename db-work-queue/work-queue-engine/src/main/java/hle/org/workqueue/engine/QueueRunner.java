@@ -96,55 +96,12 @@ final class QueueRunner implements SmartLifecycle {
         }
     }
 
-    // ---- State for health, metrics and tests -----------------------------------------------------------------
-
-    private EngineSnapshot.Execution executionSnapshot() {
-        return execution.snapshot(clock.getAsLong());
-    }
-
-    int availablePermits() { return executionSnapshot().availablePermits(); }
-    int inflight() { return executionSnapshot().inflight(); }
-    int hungTasks() { return executionSnapshot().hungTasks(); }
-    boolean hungTaskLimitReached() { return executionSnapshot().hungTaskLimitReached(); }
-
-    List<String> deadLoops() {
-        return running ? loops.deadLoops() : List.of();
-    }
-
-    /** The latest backlog sample (spec §9.6 backlog gauges), or null before the first. */
-    BacklogSample backlog() {
-        return sampler.latest();
-    }
-
-    /** Spec §9.6 {@code backlog.sample_age}: how old the sample the backlog gauges read is. */
-    Duration backlogSampleAge() {
-        return sampler.age();
-    }
-
-    long backlogSampleErrors() {
-        return sampler.errors();
-    }
-
-    long invariantViolations() { return executionSnapshot().invariantViolations(); }
-    long registrationsLate() { return executionSnapshot().registrationsLate(); }
-    long claimsLost() { return executionSnapshot().claimsLost(); }
-    long claims() { return executionSnapshot().claims(); }
-    long claimedRows() { return executionSnapshot().claimedRows(); }
-    long claimErrors() { return executionSnapshot().claimErrors(); }
-    OperationStats.Totals claimTimes() { return executionSnapshot().claimTimes(); }
-    long renewalErrors() { return executionSnapshot().renewalErrors(); }
-    OperationStats.Totals renewalTimes() { return executionSnapshot().renewalTimes(); }
-    long outcomes(Outcome outcome) { return executionSnapshot().outcomes().get(outcome); }
-    Duration renewalLag() { return executionSnapshot().renewalLag(); }
-
-    /** Spec §9.6 {@code db.last_success_age}. */
-    Duration dbLastSuccessAge() {
-        return dbActivity.lastSuccessAge();
-    }
-
-    /** True from the start of {@link #stop()}: readiness reports DOWN. */
-    boolean isStopping() {
-        return stopping;
+    /** One clock reading, no DB calls or lifecycle/registration lock; each owner supplies immutable summaries. */
+    EngineSnapshot snapshot() {
+        long now = clock.getAsLong();
+        boolean active = running;
+        return new EngineSnapshot(execution.snapshot(now), sampler.snapshot(now),
+                new EngineSnapshot.Runtime(active, stopping, active ? loops.deadLoops() : List.of()), dbActivity.ageAt(now));
     }
 
     private Duration remaining(long deadline) {

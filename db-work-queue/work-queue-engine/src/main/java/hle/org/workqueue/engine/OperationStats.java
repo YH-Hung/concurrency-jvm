@@ -22,11 +22,4 @@ final class OperationStats {
         totalNanos.addAndGet(nanos);
     }
 
-    long count() {
-        return count.get();
-    }
-
-    long totalNanos() {
-        return totalNanos.get();
-    }
 }

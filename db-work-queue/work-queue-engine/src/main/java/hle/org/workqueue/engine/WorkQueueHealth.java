@@ -5,6 +5,7 @@ import org.springframework.boot.health.contributor.Health;
 import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.Supplier;
 
 /**
  * Liveness and readiness of one instance (spec §9.6), read from its runner whenever a probe asks. Phase 3's
@@ -29,11 +30,11 @@ final class WorkQueueHealth {
         }
     }
 
-    private final QueueRunner runner;
+    private final Supplier<EngineSnapshot> snapshots;
     private final Settings settings;
 
-    WorkQueueHealth(QueueRunner runner, Settings settings) {
-        this.runner = Objects.requireNonNull(runner, "runner");
+    WorkQueueHealth(Supplier<EngineSnapshot> snapshots, Settings settings) {
+        this.snapshots = Objects.requireNonNull(snapshots, "snapshots");
         this.settings = Objects.requireNonNull(settings, "settings");
     }
 
@@ -42,10 +43,11 @@ final class WorkQueueHealth {
      * loops has died: the orchestrator's restart is the remedy for each.
      */
     Health liveness() {
-        int hungTasks = runner.hungTasks();
-        long invariantViolations = runner.invariantViolations();
-        List<String> deadLoops = runner.deadLoops();
-        boolean live = !runner.hungTaskLimitReached() && invariantViolations == 0 && deadLoops.isEmpty();
+        EngineSnapshot snapshot = snapshots.get();
+        int hungTasks = snapshot.execution().hungTasks();
+        long invariantViolations = snapshot.execution().invariantViolations();
+        List<String> deadLoops = snapshot.runtime().deadLoops();
+        boolean live = !snapshot.execution().hungTaskLimitReached() && invariantViolations == 0 && deadLoops.isEmpty();
         return (live ? Health.up() : Health.down())
                 .withDetail("hungTasks", hungTasks)
                 .withDetail("invariantViolations", invariantViolations)
@@ -58,9 +60,10 @@ final class WorkQueueHealth {
      * round B2 tolerates stays below it), and when db.last_success_age passes db-staleness-limit.
      */
     Health readiness() {
-        boolean stopping = runner.isStopping();
-        Duration renewalLag = runner.renewalLag();
-        Duration dbLastSuccessAge = runner.dbLastSuccessAge();
+        EngineSnapshot snapshot = snapshots.get();
+        boolean stopping = snapshot.runtime().stopping();
+        Duration renewalLag = snapshot.execution().renewalLag();
+        Duration dbLastSuccessAge = snapshot.dbLastSuccessAge();
         boolean ready = !stopping && renewalLag.compareTo(settings.lease()) <= 0
                 && dbLastSuccessAge.compareTo(settings.dbStalenessLimit()) <= 0;
         return (ready ? Health.up() : Health.down())

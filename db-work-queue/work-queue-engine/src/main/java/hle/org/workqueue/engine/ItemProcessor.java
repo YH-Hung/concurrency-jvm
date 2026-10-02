@@ -1,5 +1,7 @@
 package hle.org.workqueue.engine;
 
+import hle.org.workqueue.engine.EngineSnapshot.CallStatus;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -47,18 +49,6 @@ final class ItemProcessor {
     @FunctionalInterface
     interface Sleeper {
         void sleep(Duration duration) throws InterruptedException;
-    }
-
-    /** How an external call ended, for {@code call.duration{result}} (spec §9.6). */
-    enum CallStatus {
-        /** It returned a result. */
-        OK,
-        /** It threw, or returned no result. */
-        ERROR,
-        /** It threw a {@link TimeoutException}: external-call-timeout passed. */
-        TIMEOUT,
-        /** It threw InterruptedException, or the interrupt status was set when it returned or threw. */
-        INTERRUPTED
     }
 
     static final String NO_RESULT_ERROR = "the external service returned no result";
@@ -138,9 +128,11 @@ final class ItemProcessor {
         return persist(item, () -> repository.complete(owner, item.key(), result.value()));
     }
 
-    /** The calls that ended with {@code status}, and how long they took. */
-    OperationStats calls(CallStatus status) {
-        return calls.get(Objects.requireNonNull(status, "status"));
+    /** Immutable totals by call classification; later calls never modify a retained summary. */
+    Map<CallStatus, OperationStats.Totals> callStatistics() {
+        Map<CallStatus, OperationStats.Totals> totals = new EnumMap<>(CallStatus.class);
+        calls.forEach((status, stats) -> totals.put(status, stats.snapshot()));
+        return Map.copyOf(totals);
     }
 
     private Outcome interrupted(long callStart) {

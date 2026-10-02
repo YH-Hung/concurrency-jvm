@@ -4,7 +4,7 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
-import hle.org.workqueue.engine.ItemProcessor.CallStatus;
+import hle.org.workqueue.engine.EngineSnapshot.CallStatus;
 import hle.org.workqueue.engine.ScriptedRepository.Write;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -343,8 +343,8 @@ class ItemProcessorTest {
 
         processor.process(ITEM, () -> false);
 
-        assertThat(processor.calls(CallStatus.OK).count()).isEqualTo(1);
-        assertThat(processor.calls(CallStatus.OK).totalNanos()).isEqualTo(2_000_000_000L);
+        assertThat(processor.callStatistics().get(CallStatus.OK).count()).isEqualTo(1);
+        assertThat(processor.callStatistics().get(CallStatus.OK).totalNanos()).isEqualTo(2_000_000_000L);
     }
 
     @Test
@@ -433,7 +433,7 @@ class ItemProcessorTest {
     private static Map<CallStatus, Long> timed(ItemProcessor processor) {
         Map<CallStatus, Long> timed = new EnumMap<>(CallStatus.class);
         for (CallStatus status : CallStatus.values()) {
-            long count = processor.calls(status).count();
+            long count = processor.callStatistics().get(status).count();
             if (count > 0) {
                 timed.put(status, count);
             }

@@ -55,7 +55,7 @@ class WorkQueueMetricsTest {
 
     @BeforeEach
     void bind() {
-        new WorkQueueMetrics(runner, processor).bindTo(registry);
+        new WorkQueueMetrics(runner::snapshot, processor::callStatistics).bindTo(registry);
     }
 
     @AfterEach
@@ -231,6 +231,55 @@ class WorkQueueMetricsTest {
         assertThat(gauge("workqueue.backlog", "status", "pending")).as("the latest successful sample").isZero();
         assertThat(registry.get("workqueue.backlog.sample_age").timeGauge().value(SECONDS)).isEqualTo(60);
         assertThat(counter("workqueue.backlog.sample.errors")).isEqualTo(2);
+    }
+
+    @Test
+    void metersKeepTheirSummarySuppliersAliveAfterBinding() throws Exception {
+        // Micrometer keeps weak references to FunctionTimer/FunctionCounter sources. A transient supplier must
+        // remain reachable through its registered callback after the MeterBinder itself leaves the caller's scope.
+        System.gc();
+        repository.thenClaim(() -> { now.addAndGet(3 * SECOND); return List.of(); });
+        engine.execution.pollOnce();
+        repository.thenReturn(PersistResult.DONE);
+        processor.process(item(1), () -> false);
+        repository.thenSample(new BacklogSample(12, 0, 0, 0, ofSeconds(30)));
+        engine.sampler.sampleOnce();
+        assertThat(counter("workqueue.claims")).isEqualTo(1);
+        assertThat(registry.get("workqueue.claim.duration").functionTimer().count()).isEqualTo(1);
+        assertThat(registry.get("workqueue.call.duration").tag("result", "ok").functionTimer().count()).isEqualTo(1);
+        assertThat(gauge("workqueue.backlog", "status", "pending")).isEqualTo(12);
+    }
+
+    @Test
+    void metersBoundOnceObserveLaterClaimsCallsAndSamples() throws Exception {
+        FunctionTimer claims = registry.get("workqueue.claim.duration").functionTimer();
+        FunctionTimer calls = registry.get("workqueue.call.duration").tag("result", "ok").functionTimer();
+        assertThat(claims.count()).isZero();
+        assertThat(calls.count()).isZero();
+        for (int pass = 1; pass <= 2; pass++) {
+            repository.thenClaim(() -> { now.addAndGet(3 * SECOND); return List.of(); });
+            engine.execution.pollOnce();
+            repository.thenReturn(PersistResult.DONE);
+            processor.process(item(pass), () -> false);
+            repository.thenSample(new BacklogSample(12L * pass, 0, 0, 0, ofSeconds(30)));
+            engine.sampler.sampleOnce();
+            assertThat(claims.count()).isEqualTo(pass);
+            assertThat(claims.totalTime(SECONDS)).isEqualTo(3 * pass);
+            assertThat(counter("workqueue.claims")).isEqualTo(pass);
+            assertThat(calls.count()).isEqualTo(pass);
+            assertThat(calls.totalTime(SECONDS)).isEqualTo(2 * pass);
+            assertThat(gauge("workqueue.backlog", "status", "pending")).isEqualTo(12 * pass);
+        }
+    }
+
+    @Test
+    void aClaimAlreadyEndedInTheDbIsNotCountedLost() throws Exception {
+        claimAndStart(item(1));
+        repository.thenRenewEnded(new ClaimKey(1, 1));
+        engine.execution.renewOnce();
+        assertThat(counter("workqueue.claims.lost")).isZero();
+        assertThat(gauge("workqueue.inflight")).isEqualTo(1);
+        assertThat(handles).noneMatch(ClaimHandle::isCancelled);
     }
 
     private void claimAndStart(ClaimedItem... items) throws InterruptedException {

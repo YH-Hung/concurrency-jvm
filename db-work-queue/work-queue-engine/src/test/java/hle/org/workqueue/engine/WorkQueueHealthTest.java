@@ -3,12 +3,15 @@ package hle.org.workqueue.engine;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.health.contributor.Health;
 import org.springframework.boot.health.contributor.Status;
 import org.springframework.dao.DataAccessResourceFailureException;
 
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -46,7 +49,7 @@ class WorkQueueHealthTest {
                 return ClaimExecution.VIRTUAL_THREADS.newThread(handle, body);
             }, now::get, new ConcurrentHashMap<>());
     private final QueueRunner runner = engine.runner;
-    private final WorkQueueHealth health = new WorkQueueHealth(runner, WorkQueueHealth.Settings.from(DEFAULTS));
+    private final WorkQueueHealth health = new WorkQueueHealth(runner::snapshot, WorkQueueHealth.Settings.from(DEFAULTS));
 
     @AfterEach
     void endEveryTask() {
@@ -66,7 +69,7 @@ class WorkQueueHealthTest {
             now.addAndGet(pause.toNanos());
 
             assertThat(health.readiness().getStatus()).isEqualTo(Status.UP);
-            assertThat(runner.renewalLag()).isZero();
+            assertThat(runner.snapshot().execution().renewalLag()).isZero();
         }
     }
 
@@ -160,7 +163,7 @@ class WorkQueueHealthTest {
         assertThat(health.readiness().getStatus()).isEqualTo(Status.UP);
         FutureTask<Void> stop = new FutureTask<>(runner::stop, null);
         Thread.ofVirtual().start(stop);
-        await().until(runner::isStopping);
+        await().until(() -> runner.snapshot().runtime().stopping());
 
         Health draining = health.readiness();
 
@@ -210,7 +213,7 @@ class WorkQueueHealthTest {
         assertThat(health.liveness().getStatus()).isEqualTo(Status.DOWN);
         assertThat(health.liveness().getDetails()).containsEntry("hungTasks", 4);
         tasks.release(new ClaimKey(1, 1));
-        await().until(() -> runner.hungTasks() == 3);
+        await().until(() -> runner.snapshot().execution().hungTasks() == 3);
         assertThat(health.liveness().getStatus()).isEqualTo(Status.UP);
     }
 
@@ -236,10 +239,78 @@ class WorkQueueHealthTest {
 
         runner.start();
 
-        await().until(() -> runner.deadLoops().size() == 2);
+        await().until(() -> runner.snapshot().runtime().deadLoops().size() == 2);
         assertThat(health.liveness().getStatus()).isEqualTo(Status.DOWN);
         assertThat(health.liveness().getDetails()).containsEntry("deadLoops", List.of("sweeper", "backlog-sampler"));
         assertThat(health.readiness().getStatus()).isEqualTo(Status.UP);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 2, 4})
+    void livenessUsesTheConfiguredHungTaskThreshold(int limit) throws Exception {
+        WorkQueueProperties properties = ItConfig.properties();
+        properties.setHungTaskLimit(limit);
+        properties.setConcurrency(limit + 1);
+        List<ClaimHandle> active = new CopyOnWriteArrayList<>();
+        Tasks work = new Tasks();
+        work.ignoreInterrupts();
+        EngineFixture configured = new EngineFixture(repository, work, "instance-a", EngineSettings.from(properties),
+                (handle, body) -> { active.add(handle); return ClaimExecution.VIRTUAL_THREADS.newThread(handle, body); },
+                now::get, new ConcurrentHashMap<>());
+        WorkQueueHealth probe = new WorkQueueHealth(configured.runner::snapshot, WorkQueueHealth.Settings.from(properties));
+        repository.thenClaim(java.util.stream.LongStream.rangeClosed(1, limit).mapToObj(WorkQueueHealthTest::item)
+                .toArray(ClaimedItem[]::new));
+        try {
+            configured.execution.pollOnce();
+            await().until(() -> work.started().size() == limit);
+            active.getFirst().cancel(ClaimHandle.CancelReason.DEADLINE, now.get());
+            now.addAndGet(properties.getHungGrace().toNanos());
+            configured.execution.superviseOnce();
+            assertThat(probe.liveness().getStatus()).isEqualTo(limit == 1 ? Status.DOWN : Status.UP);
+            assertThat(probe.liveness().getDetails()).containsEntry("hungTasks", 1);
+            active.stream().skip(1).forEach(handle -> handle.cancel(ClaimHandle.CancelReason.DEADLINE, now.get()));
+            now.addAndGet(properties.getHungGrace().toNanos());
+            configured.execution.superviseOnce();
+            assertThat(probe.liveness().getStatus()).isEqualTo(Status.DOWN);
+            assertThat(probe.liveness().getDetails()).containsEntry("hungTasks", limit);
+            work.release(active.getFirst().key());
+            await().until(() -> configured.runner.snapshot().execution().hungTasks() == limit - 1);
+            assertThat(probe.liveness().getStatus()).isEqualTo(Status.UP);
+            assertThat(probe.liveness().getDetails()).containsEntry("hungTasks", limit - 1);
+        } finally {
+            configured.runner.crash();
+            work.releaseAll();
+            await().until(() -> active.stream().allMatch(ClaimHandle::isEnded));
+            assertThat(configured.runner.snapshot().execution().availablePermits()).isEqualTo(limit + 1);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"poll", "renewal", "supervisor", "sweeper", "backlog-sampler"})
+    void everyUnexpectedlyDeadLoopMakesLivenessDown(String name) {
+        ScriptedRepository db = new ScriptedRepository();
+        if (name.equals("sweeper")) db.thenSweep(() -> { throw new StackOverflowError(); });
+        if (name.equals("backlog-sampler")) db.thenSample(() -> { throw new StackOverflowError(); });
+        EngineFixture configured = new EngineFixture(db, new Tasks(), "instance-a", EngineSettings.from(ItConfig.properties()),
+                ClaimExecution.VIRTUAL_THREADS, System::nanoTime, new ConcurrentHashMap<>() {
+            @Override
+            public Collection<ClaimHandle> values() {
+                if (Thread.currentThread().getName().equals("workqueue-" + name)) throw new StackOverflowError();
+                return super.values();
+            }
+        });
+        WorkQueueHealth probe = new WorkQueueHealth(configured.runner::snapshot,
+                WorkQueueHealth.Settings.from(ItConfig.properties()));
+        try {
+            configured.runner.start();
+            await().until(() -> probe.liveness().getStatus().equals(Status.DOWN));
+            assertThat(probe.liveness().getDetails()).containsEntry("deadLoops", List.of(name));
+            configured.runner.stop();
+            assertThat(probe.liveness().getStatus()).isEqualTo(Status.UP);
+            assertThat(probe.liveness().getDetails()).containsEntry("deadLoops", List.of());
+        } finally {
+            configured.runner.crash();
+        }
     }
 
     // ---- Settings -------------------------------------------------------------------------------------------
