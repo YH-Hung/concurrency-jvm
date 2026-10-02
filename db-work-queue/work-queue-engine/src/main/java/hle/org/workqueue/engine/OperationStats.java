@@ -11,6 +11,12 @@ final class OperationStats {
     private final AtomicLong count = new AtomicLong();
     private final AtomicLong totalNanos = new AtomicLong();
 
+    record Totals(long count, long totalNanos) {}
+
+    Totals snapshot() {
+        return new Totals(count.get(), totalNanos.get());
+    }
+
     void record(long nanos) {
         count.incrementAndGet();
         totalNanos.addAndGet(nanos);

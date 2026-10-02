@@ -1,6 +1,5 @@
 package hle.org.workqueue.engine;
 
-import hle.org.workqueue.engine.ClaimHandle.CancelReason;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.SmartLifecycle;
@@ -21,32 +20,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
 
-/**
- * Runs the queue on one instance (spec §5.2): the poll loop claims rows and starts one virtual thread per claim, the
- * renewal loop keeps the claims' leases, and the DB-free supervisor enforces deadlines and detects hung tasks; two
- * more loops run the {@link Sweeper} and the {@link BacklogSampler}. It alone creates handles, starts their threads,
- * and holds the registry and the permits; the permit invariant {@code permits.available + handles not ended + held =
- * concurrency} holds whenever the poll loop is between iterations. Times are {@code System.nanoTime()} readings from
- * the injected clock, compared overflow-safely.
- */
+/** Coordinates instance lifecycle; ClaimExecution owns the active-claim protocol. */
 final class QueueRunner implements SmartLifecycle {
-
-    /** Processes one claimed row: {@link ItemProcessor#process} in production. */
-    @FunctionalInterface
-    interface Processor {
-        Outcome process(ClaimedItem item, BooleanSupplier cancelled);
-    }
-
-    /** Creates, without starting it, the thread that runs one claim's body. */
-    @FunctionalInterface
-    interface TaskThreads {
-        Thread newThread(ClaimHandle handle, Runnable body);
-    }
-
-    /** One virtual thread per claim, named after its row and token (spec §5.2 execution model). */
-    static final TaskThreads VIRTUAL_THREADS = (handle, body) -> Thread.ofVirtual()
-            .name("workqueue-task-" + handle.key().id() + "-" + handle.key().token())
-            .unstarted(body);
 
     /** Starts the thread that runs one of the five loops. */
     @FunctionalInterface
@@ -63,49 +38,18 @@ final class QueueRunner implements SmartLifecycle {
      */
     private static final Duration LOOP_JOIN_TIMEOUT = Duration.ofSeconds(1);
 
-    /** How often {@link #stop()} checks whether the registry has emptied. */
-    private static final Duration DRAIN_CHECK_INTERVAL = Duration.ofMillis(10);
-
     private static final Logger log = LoggerFactory.getLogger(QueueRunner.class);
 
-    private final WorkItemRepository repository;
-    private final Processor processor;
+    private final ClaimExecution execution;
     private final String owner;
     private final EngineSettings settings;
-    private final TaskThreads taskThreads;
     private final LoopThreads loopThreads;
     private final LongSupplier clock;
-    private final ConcurrentMap<ClaimKey, ClaimHandle> registry;
-    private final Semaphore permits;
     private final RenewalSchedule schedule;
     private final DbActivity dbActivity;
     private final Sweeper sweeper;
     private final BacklogSampler sampler;
-
-    // What health and the meters read (spec §9.6); WorkQueueMetrics binds them.
-    private final AtomicLong invariantViolations = new AtomicLong();
-    private final AtomicLong registrationsLate = new AtomicLong();
-    private final AtomicLong claimsLost = new AtomicLong();
-    private final AtomicLong claims = new AtomicLong();
-    private final AtomicLong claimedRows = new AtomicLong();
-    private final AtomicLong claimErrors = new AtomicLong();
-    private final OperationStats claimTimes = new OperationStats();
-    private final AtomicLong renewalErrors = new AtomicLong();
-    private final OperationStats renewalTimes = new OperationStats();
-    private final Map<Outcome, AtomicLong> outcomes = new EnumMap<>(Outcome.class);
-
-    // cancelAll sets cancelOnRegister and walks the registry under this lock, and registerAndStart registers a
-    // handle and reads cancelOnRegister under it, so a handle is either in the registry when a cancel pass walks it
-    // or reads that pass's reason. stop() takes it inside lifecycle, crash() before lifecycle, and registerAndStart
-    // never takes lifecycle. It is reentrant, for a test that crashes the runner from inside a registration.
-    private final Object registrationLock = new Object();
-
-    // Once set, every handle registered from then on is cancelled before its thread starts, so crash() and stop()
-    // also reach a handle the poll loop has transferred but not yet registered. Volatile for start()'s unlocked read.
-    private volatile CancelReason cancelOnRegister;
-
-    // Only the poll loop reads or writes this.
-    private int claimFailures;
+    private volatile boolean aborted;
 
     private final Object lifecycle = new Object();
     private boolean started;
@@ -122,37 +66,31 @@ final class QueueRunner implements SmartLifecycle {
     private Thread sweeperThread;
     private Thread samplerThread;
 
-    QueueRunner(WorkItemRepository repository, Processor processor, String owner, EngineSettings settings) {
-        this(repository, processor, owner, settings, VIRTUAL_THREADS, System::nanoTime, new ConcurrentHashMap<>());
+    QueueRunner(WorkItemRepository repository, ClaimExecution.Processor processor, String owner, EngineSettings settings) {
+        this(repository, processor, owner, settings, ClaimExecution.VIRTUAL_THREADS, System::nanoTime, new ConcurrentHashMap<>());
     }
 
     /** For tests: the task threads, the clock and the registry are injectable. */
-    QueueRunner(WorkItemRepository repository, Processor processor, String owner, EngineSettings settings,
-                TaskThreads taskThreads, LongSupplier clock, ConcurrentMap<ClaimKey, ClaimHandle> registry) {
+    QueueRunner(WorkItemRepository repository, ClaimExecution.Processor processor, String owner, EngineSettings settings,
+                ClaimExecution.TaskThreads taskThreads, LongSupplier clock, ConcurrentMap<ClaimKey, ClaimHandle> registry) {
         this(repository, processor, owner, settings, taskThreads, clock, registry, VIRTUAL_LOOP_THREADS);
     }
 
     /** For tests of a loop thread that fails to start. */
-    QueueRunner(WorkItemRepository repository, Processor processor, String owner, EngineSettings settings,
-                TaskThreads taskThreads, LongSupplier clock, ConcurrentMap<ClaimKey, ClaimHandle> registry,
+    QueueRunner(WorkItemRepository repository, ClaimExecution.Processor processor, String owner, EngineSettings settings,
+                ClaimExecution.TaskThreads taskThreads, LongSupplier clock, ConcurrentMap<ClaimKey, ClaimHandle> registry,
                 LoopThreads loopThreads) {
         WorkItemRepository.requireOwner(owner);
-        this.repository = Objects.requireNonNull(repository, "repository");
-        this.processor = Objects.requireNonNull(processor, "processor");
         this.owner = owner;
         this.settings = Objects.requireNonNull(settings, "settings");
-        this.taskThreads = Objects.requireNonNull(taskThreads, "taskThreads");
         this.loopThreads = Objects.requireNonNull(loopThreads, "loopThreads");
         this.clock = Objects.requireNonNull(clock, "clock");
-        this.registry = Objects.requireNonNull(registry, "registry");
-        this.permits = new Semaphore(settings.concurrency());
         this.schedule = new RenewalSchedule(settings.renewInterval(), settings.renewRetryDelay());
         this.dbActivity = new DbActivity(clock);
+        this.execution = new ClaimExecution(repository, processor, owner, settings, dbActivity, clock,
+                taskThreads, registry);
         this.sweeper = new Sweeper(repository, owner, settings.sweepBatchSize(), dbActivity);
         this.sampler = new BacklogSampler(repository, owner, dbActivity, clock);
-        for (Outcome outcome : Outcome.values()) {
-            outcomes.put(outcome, new AtomicLong());
-        }
     }
 
     // ---- Lifecycle -------------------------------------------------------------------------------------------
@@ -164,7 +102,7 @@ final class QueueRunner implements SmartLifecycle {
             if (running) {
                 return;
             }
-            if (started || cancelOnRegister != null) {
+            if (started || aborted) {
                 throw new IllegalStateException("a QueueRunner cannot be restarted");
             }
             started = true;
@@ -187,7 +125,7 @@ final class QueueRunner implements SmartLifecycle {
                 supervising = false;
                 sweeping = false;
                 sampling = false;
-                cancelAll(CancelReason.SHUTDOWN);
+                execution.cancelForShutdown();
                 for (Thread loop : Arrays.asList(pollThread, renewalThread, supervisorThread, sweeperThread)) {
                     if (loop != null) {
                         loop.interrupt();
@@ -222,9 +160,9 @@ final class QueueRunner implements SmartLifecycle {
             polling = false;
             pollThread.interrupt();
             join(pollThread, remaining(graceEnd));
-            awaitDrained(graceEnd);
-            cancelAll(CancelReason.SHUTDOWN);
-            awaitDrained(clock.getAsLong() + settings.shutdownCancelWait().toNanos());
+            execution.awaitDrained(graceEnd);
+            execution.cancelForShutdown();
+            execution.awaitDrained(clock.getAsLong() + settings.shutdownCancelWait().toNanos());
             renewing = false;
             supervising = false;
             sweeping = false;
@@ -246,12 +184,13 @@ final class QueueRunner implements SmartLifecycle {
 
     /** Tests only (spec §5.2): stops every loop and cancels every claim at once, without draining or waiting. */
     void crash() {
+        aborted = true;
         polling = false;
         renewing = false;
         supervising = false;
         sweeping = false;
         sampling = false;
-        cancelAll(CancelReason.CRASH);
+        execution.abort();
         synchronized (lifecycle) {
             if (running) {
                 pollThread.interrupt();
@@ -276,10 +215,7 @@ final class QueueRunner implements SmartLifecycle {
                     pause = pollOnce();
                 } catch (InterruptedException e) {
                     return;
-                } catch (RuntimeException e) {
-                    pause = backoff();
-                    log.error("Poll of owner {} failed; next claim in {}: {}", owner, pause,
-                            Diagnostics.describe(e));
+
                 }
                 if (!sleep(pause)) {
                     return;
@@ -290,124 +226,8 @@ final class QueueRunner implements SmartLifecycle {
         }
     }
 
-    /**
-     * One poll-loop iteration (spec §5.2 steps 1–3): acquire permits, claim that many rows, then transfer one permit
-     * to each claimed row's handle, register it and start its thread. Every permit the loop still holds is returned
-     * on every path. Returns the pause before the next iteration: none after a claim that found rows, the jittered
-     * idle interval after an empty one, a growing backoff after a failed one.
-     *
-     * @throws InterruptedException if interrupted while waiting for a permit
-     */
     Duration pollOnce() throws InterruptedException {
-        int held = 0;
-        try {
-            permits.acquire();
-            held = 1;
-            while (held < settings.claimBatchSize() && permits.tryAcquire()) {
-                held++;
-            }
-            if (hungTaskLimitReached()) {
-                return settings.supervisorInterval();
-            }
-            long claimStartedAt = clock.getAsLong();
-            List<ClaimedItem> claimed;
-            try {
-                claimed = repository.claim(owner, held);
-            } catch (RuntimeException e) {
-                claimTimes.record(clock.getAsLong() - claimStartedAt);
-                claimErrors.incrementAndGet();
-                // The outcome is uncertain: rows may have committed. They are never registered, so they expire
-                // unrenewed with their attempt consumed (spec §5.2).
-                Duration pause = backoff();
-                log.warn("Claim by owner {} failed; nothing claimed, next claim in {}: {}", owner, pause,
-                        Diagnostics.describe(e));
-                return pause;
-            }
-            long claimedAt = clock.getAsLong();
-            claimTimes.record(claimedAt - claimStartedAt);
-            claims.incrementAndGet();
-            claimedRows.addAndGet(claimed.size());
-            dbActivity.succeeded();
-            claimFailures = 0;
-            if (claimed.size() > held) {
-                // Only the first held rows get a permit. The rest are CLAIMED but never registered, so, like the rows
-                // of an uncertain claim, they expire unrenewed with their attempt consumed.
-                invariantViolations.incrementAndGet();
-                log.error("Invariant violation: claim by owner {} returned {} rows for {} permits; {} not started",
-                        owner, claimed.size(), held, claimed.size() - held);
-                claimed = claimed.subList(0, held);
-            }
-            for (ClaimedItem item : claimed) {
-                ClaimHandle handle = new ClaimHandle(item, claimStartedAt, claimedAt, settings.maxProcessingTime(),
-                        registry, permits);
-                Thread thread = Objects.requireNonNull(taskThreads.newThread(handle, () -> runTask(handle)), "thread");
-                held--;   // the transfer: from here on the handle owns this permit
-                registerAndStart(handle, thread, claimedAt);
-            }
-            return claimed.isEmpty() ? idlePause() : Duration.ZERO;
-        } finally {
-            permits.release(held);
-        }
-    }
-
-    // Spec §5.2 step 3. Every failure between the transfer and a successful start ends the handle through finish().
-    // Nothing may follow thread.start() in this try: once the thread runs, only its own body may finish the handle.
-    private void registerAndStart(ClaimHandle handle, Thread thread, long claimedAt) {
-        try {
-            synchronized (registrationLock) {
-                if (!handle.register()) {
-                    invariantViolations.incrementAndGet();
-                    log.error("Invariant violation: claim {} of owner {} is already registered; not started",
-                            handle, owner);
-                    handle.finish();
-                    return;
-                }
-                CancelReason reason = cancelOnRegister;
-                if (reason != null) {
-                    handle.cancel(reason, clock.getAsLong());
-                }
-            }
-            if (clock.getAsLong() - claimedAt > settings.registrationAllowance().toNanos()) {
-                registrationsLate.incrementAndGet();
-            }
-            thread.start();
-        } catch (Throwable t) {
-            handle.finish();
-            log.error("Could not start claim {} of owner {}: {}", handle, owner, Diagnostics.describe(t));
-        }
-    }
-
-    // Spec §5.2 step 4. Catches every Throwable: an uncaught one would reach the thread's default handler, which
-    // prints its message (spec §5.4). A task cancelled before its body ran ends CANCELLED; one that threw has no
-    // outcome.
-    private void runTask(ClaimHandle handle) {
-        try {
-            Outcome outcome = handle.markRunning()
-                    ? processor.process(handle.item(), handle::isCancelled)
-                    : Outcome.CANCELLED;
-            outcomes.get(Objects.requireNonNull(outcome, "outcome")).incrementAndGet();
-            log.debug("Claim {} of owner {} ended {}", handle, owner, outcome);
-        } catch (Throwable t) {
-            log.error("Task for claim {} of owner {} failed: {}", handle, owner, Diagnostics.describe(t));
-        } finally {
-            handle.finish();
-        }
-    }
-
-    // The idle interval ± 50%, so idle instances do not poll in step.
-    private Duration idlePause() {
-        long idle = settings.idlePollInterval().toNanos();
-        return Duration.ofNanos(idle / 2 + ThreadLocalRandom.current().nextLong(idle + 1));
-    }
-
-    // idle-poll-interval, doubled after every consecutive failure, capped at poll-backoff-max.
-    private Duration backoff() {
-        Duration pause = settings.idlePollInterval();
-        for (int i = 0; i < claimFailures && pause.compareTo(settings.pollBackoffMax()) < 0; i++) {
-            pause = pause.multipliedBy(2);
-        }
-        claimFailures++;
-        return pause.compareTo(settings.pollBackoffMax()) < 0 ? pause : settings.pollBackoffMax();
+        return execution.pollOnce();
     }
 
     // ---- Renewal loop ----------------------------------------------------------------------------------------
@@ -434,55 +254,8 @@ final class QueueRunner implements SmartLifecycle {
         }
     }
 
-    /**
-     * One renewal round (spec §5.3) over a snapshot, taken at its start, of the handles that are renewable then.
-     * Every claim the round renews has its lease counted from the round's start. Every claim it reports lost is
-     * counted and cancelled; a claim its own task already ended is neither, and a lost claim the round did not
-     * request is an invariant violation.
-     * Returns whether the round succeeded; a round with nothing to renew is skipped and succeeds.
-     */
     boolean renewOnce() {
-        long start = clock.getAsLong();
-        Map<ClaimKey, ClaimHandle> snapshot = new HashMap<>();
-        for (ClaimHandle handle : registry.values()) {
-            if (handle.isRenewable(start)) {
-                snapshot.put(handle.key(), handle);
-            }
-        }
-        if (snapshot.isEmpty()) {
-            return true;
-        }
-        RenewalResult result;
-        try {
-            result = repository.renew(owner, snapshot.keySet());
-        } catch (RuntimeException e) {
-            renewalTimes.record(clock.getAsLong() - start);
-            renewalErrors.incrementAndGet();
-            log.warn("Renewal of {} claims of owner {} failed: {}", snapshot.size(), owner, Diagnostics.describe(e));
-            return false;
-        }
-        long now = clock.getAsLong();
-        renewalTimes.record(now - start);
-        dbActivity.succeeded();
-        for (ClaimKey key : result.renewed()) {
-            ClaimHandle handle = snapshot.get(key);
-            if (handle != null) {   // the repository renews only the pairs it was given
-                handle.leaseRenewed(start);
-            }
-        }
-        for (ClaimKey key : result.lost()) {
-            ClaimHandle handle = snapshot.get(key);
-            if (handle == null) {
-                invariantViolations.incrementAndGet();
-                log.error("Invariant violation: renewal of owner {} reported claim {} lost, which it did not request",
-                        owner, key);
-                continue;
-            }
-            claimsLost.incrementAndGet();
-            log.warn("Claim {} of owner {} was lost; cancelling it", key, owner);
-            handle.cancel(CancelReason.LOST, now);
-        }
-        return true;
+        return execution.renewOnce();
     }
 
     // ---- Supervisor ------------------------------------------------------------------------------------------
@@ -504,30 +277,8 @@ final class QueueRunner implements SmartLifecycle {
         }
     }
 
-    /**
-     * One supervisor pass (spec §5.2): cancels every claim past its deadline, and marks hung every cancelled claim
-     * whose thread is still running hung-grace after the cancel, logging it once with its stack. Never waits on Db2.
-     */
     void superviseOnce() {
-        long now = clock.getAsLong();
-        for (ClaimHandle handle : registry.values()) {
-            if (handle.isPastDeadline(now) && handle.cancel(CancelReason.DEADLINE, now)) {
-                log.warn("Claim {} of owner {} reached max-processing-time; cancelling it", handle, owner);
-            }
-            if (handle.markHungIfOverdue(now, settings.hungGrace())) {
-                log.error("Claim {} of owner {} is hung: still running {} after it was cancelled ({}); it keeps its"
-                        + " permit until its thread ends{}", handle, owner, settings.hungGrace(),
-                        handle.cancelReason(), stack(handle.runnerStackTrace()));
-            }
-        }
-    }
-
-    private static String stack(StackTraceElement[] frames) {
-        StringBuilder text = new StringBuilder();
-        for (StackTraceElement frame : frames) {
-            text.append(System.lineSeparator()).append("\tat ").append(frame);
-        }
-        return text.toString();
+        execution.superviseOnce();
     }
 
     // ---- Sweeper and backlog sampler -------------------------------------------------------------------------
@@ -567,29 +318,14 @@ final class QueueRunner implements SmartLifecycle {
 
     // ---- State for health, metrics and tests -----------------------------------------------------------------
 
-    int availablePermits() {
-        return permits.availablePermits();
+    private EngineSnapshot.Execution executionSnapshot() {
+        return execution.snapshot(clock.getAsLong());
     }
 
-    /** Registered handles: running, or cancelled and not yet ended. */
-    int inflight() {
-        return registry.size();
-    }
-
-    int hungTasks() {
-        int hung = 0;
-        for (ClaimHandle handle : registry.values()) {
-            if (handle.isHung()) {
-                hung++;
-            }
-        }
-        return hung;
-    }
-
-    /** Hung tasks have reached hung-task-limit: the poll loop stops claiming and liveness reports DOWN. */
-    boolean hungTaskLimitReached() {
-        return hungTasks() >= settings.hungTaskLimit();
-    }
+    int availablePermits() { return executionSnapshot().availablePermits(); }
+    int inflight() { return executionSnapshot().inflight(); }
+    int hungTasks() { return executionSnapshot().hungTasks(); }
+    boolean hungTaskLimitReached() { return executionSnapshot().hungTaskLimitReached(); }
 
     /**
      * The loops (spec §9.6) that ended while the runner still wanted them: an Error ended them, or an interrupt that
@@ -637,66 +373,17 @@ final class QueueRunner implements SmartLifecycle {
         return sampler.errors();
     }
 
-    long invariantViolations() {
-        return invariantViolations.get();
-    }
-
-    long registrationsLate() {
-        return registrationsLate.get();
-    }
-
-    long claimsLost() {
-        return claimsLost.get();
-    }
-
-    /** Claim operations that returned, with rows or without. */
-    long claims() {
-        return claims.get();
-    }
-
-    /** The rows those claim operations returned: each is a claim, which renewal may later report lost. */
-    long claimedRows() {
-        return claimedRows.get();
-    }
-
-    /** Claim operations that failed: their outcome is unknown. */
-    long claimErrors() {
-        return claimErrors.get();
-    }
-
-    /** The duration of every claim operation, returned or failed. */
-    OperationStats claimTimes() {
-        return claimTimes;
-    }
-
-    long renewalErrors() {
-        return renewalErrors.get();
-    }
-
-    /** The duration of every renewal round that ran; a skipped round is not one. */
-    OperationStats renewalTimes() {
-        return renewalTimes;
-    }
-
-    /** Tasks that ended with {@code outcome}. */
-    long outcomes(Outcome outcome) {
-        return outcomes.get(Objects.requireNonNull(outcome, "outcome")).get();
-    }
-
-    /**
-     * Spec §9.6 {@code renewal.lag}: the longest time since a renewal-eligible claim's lease was last written, counted
-     * from the start of the operation that wrote it; zero without renewal-eligible claims.
-     */
-    Duration renewalLag() {
-        long now = clock.getAsLong();
-        long lag = 0;
-        for (ClaimHandle handle : registry.values()) {
-            if (handle.isRenewable(now)) {
-                lag = Math.max(lag, now - handle.leaseWrittenAt());
-            }
-        }
-        return Duration.ofNanos(lag);
-    }
+    long invariantViolations() { return executionSnapshot().invariantViolations(); }
+    long registrationsLate() { return executionSnapshot().registrationsLate(); }
+    long claimsLost() { return executionSnapshot().claimsLost(); }
+    long claims() { return executionSnapshot().claims(); }
+    long claimedRows() { return executionSnapshot().claimedRows(); }
+    long claimErrors() { return executionSnapshot().claimErrors(); }
+    OperationStats.Totals claimTimes() { return executionSnapshot().claimTimes(); }
+    long renewalErrors() { return executionSnapshot().renewalErrors(); }
+    OperationStats.Totals renewalTimes() { return executionSnapshot().renewalTimes(); }
+    long outcomes(Outcome outcome) { return executionSnapshot().outcomes().get(outcome); }
+    Duration renewalLag() { return executionSnapshot().renewalLag(); }
 
     /** Spec §9.6 {@code db.last_success_age}. */
     Duration dbLastSuccessAge() {
@@ -709,25 +396,6 @@ final class QueueRunner implements SmartLifecycle {
     }
 
     // ---- Helpers ---------------------------------------------------------------------------------------------
-
-    private void cancelAll(CancelReason reason) {
-        synchronized (registrationLock) {
-            cancelOnRegister = reason;
-            long now = clock.getAsLong();
-            for (ClaimHandle handle : registry.values()) {
-                handle.cancel(reason, now);
-            }
-        }
-    }
-
-    private void awaitDrained(long deadline) {
-        while (!registry.isEmpty()) {
-            Duration left = remaining(deadline);
-            if (left.isZero() || !sleep(left.compareTo(DRAIN_CHECK_INTERVAL) < 0 ? left : DRAIN_CHECK_INTERVAL)) {
-                return;
-            }
-        }
-    }
 
     private Duration remaining(long deadline) {
         return Duration.ofNanos(Math.max(0, deadline - clock.getAsLong()));

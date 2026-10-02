@@ -43,7 +43,7 @@ class WorkQueueHealthTest {
     private final QueueRunner runner = new QueueRunner(repository, tasks, "instance-a",
             EngineSettings.from(DEFAULTS), (handle, body) -> {
                 handles.add(handle);
-                return QueueRunner.VIRTUAL_THREADS.newThread(handle, body);
+                return ClaimExecution.VIRTUAL_THREADS.newThread(handle, body);
             }, now::get, new ConcurrentHashMap<>());
     private final WorkQueueHealth health = new WorkQueueHealth(runner, WorkQueueHealth.Settings.from(DEFAULTS));
 

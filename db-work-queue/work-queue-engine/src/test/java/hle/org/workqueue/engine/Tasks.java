@@ -12,7 +12,7 @@ import java.util.function.BooleanSupplier;
  * A QueueRunner processor for unit tests: tasks that run until released, then end with their scripted outcome
  * (COMPLETED by default). An interrupt ends a task INTERRUPTED at once, unless the tasks ignore interrupts.
  */
-final class Tasks implements QueueRunner.Processor {
+final class Tasks implements ClaimExecution.Processor {
 
     private final Map<ClaimKey, CountDownLatch> releases = new ConcurrentHashMap<>();
     private final Map<ClaimKey, Outcome> outcomes = new ConcurrentHashMap<>();

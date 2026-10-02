@@ -44,7 +44,7 @@ class WorkQueueMetricsTest {
                 if (registerLate.get()) {
                     now.addAndGet(SECOND);   // past registration-allowance (200ms)
                 }
-                return QueueRunner.VIRTUAL_THREADS.newThread(handle, body);
+                return ClaimExecution.VIRTUAL_THREADS.newThread(handle, body);
             }, now::get, new ConcurrentHashMap<>());
     private final ItemProcessor processor = new ItemProcessor(repository, (key, token, payload, timeout) -> {
         now.addAndGet(2 * SECOND);   // every call takes 2s

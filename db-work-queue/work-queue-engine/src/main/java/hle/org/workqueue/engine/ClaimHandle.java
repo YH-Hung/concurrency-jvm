@@ -7,7 +7,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * One claim's lifecycle (spec §5.2). From the moment the poll loop transfers a permit to it, the handle owns that
+ * One claim's lifecycle, internal to ClaimExecution (spec §5.2). From the permit transfer onward, it owns that
  * permit and returns it exactly once, in {@link #finish()}, on every path. Cancelling only stops renewal and
  * interrupts the handle's thread: the permit stays taken until that thread ends, so a task that ignores
  * interruption still counts against concurrency. Times are {@code System.nanoTime()} readings, compared

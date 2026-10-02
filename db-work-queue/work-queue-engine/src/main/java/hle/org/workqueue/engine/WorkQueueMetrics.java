@@ -12,6 +12,7 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.function.ToDoubleFunction;
+import java.util.function.Supplier;
 
 /**
  * The engine's Micrometer meters (spec §9.6), all named {@code workqueue.*}. Each one reads the runner's or the
@@ -36,7 +37,7 @@ final class WorkQueueMetrics implements MeterBinder {
                 QueueRunner::claims);
         counter(registry, "workqueue.claim.rows", "Rows that claim operations returned", QueueRunner::claimedRows);
         timer(registry, "workqueue.claim.duration", "Claim operations, returned or failed", Tags.empty(),
-                runner.claimTimes());
+                runner::claimTimes);
         counter(registry, "workqueue.claim.errors", "Claim operations that failed", QueueRunner::claimErrors);
         for (Outcome outcome : Outcome.values()) {
             FunctionCounter.builder("workqueue.outcomes", runner, r -> r.outcomes(outcome))
@@ -46,9 +47,9 @@ final class WorkQueueMetrics implements MeterBinder {
         }
         for (ItemProcessor.CallStatus status : ItemProcessor.CallStatus.values()) {
             timer(registry, "workqueue.call.duration", "External calls, by how they ended",
-                    Tags.of("result", tagValue(status)), processor.calls(status));
+                    Tags.of("result", tagValue(status)), () -> processor.calls(status).snapshot());
         }
-        timer(registry, "workqueue.renewal.duration", "Renewal rounds that ran", Tags.empty(), runner.renewalTimes());
+        timer(registry, "workqueue.renewal.duration", "Renewal rounds that ran", Tags.empty(), runner::renewalTimes);
         counter(registry, "workqueue.renewal.errors", "Renewal rounds that failed", QueueRunner::renewalErrors);
         timeGauge(registry, "workqueue.renewal.lag", "Longest time since a renewal-eligible claim's lease was"
                 + " written; 0 without one", r -> r.renewalLag().toNanos());
@@ -83,8 +84,8 @@ final class WorkQueueMetrics implements MeterBinder {
     }
 
     private static void timer(MeterRegistry registry, String name, String description, Tags tags,
-                              OperationStats stats) {
-        FunctionTimer.builder(name, stats, OperationStats::count, OperationStats::totalNanos, TimeUnit.NANOSECONDS)
+                              Supplier<OperationStats.Totals> stats) {
+        FunctionTimer.builder(name, stats, s -> s.get().count(), s -> s.get().totalNanos(), TimeUnit.NANOSECONDS)
                 .description(description)
                 .tags(tags)
                 .register(registry);
