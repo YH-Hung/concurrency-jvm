@@ -1,5 +1,7 @@
 # Work Queue Phase 2b: ClaimHandle and ItemProcessor Implementation Plan
 
+> **Deprecated (2026-10-03).** This describes the old db-work-queue design, which was deleted and replaced. Don't implement from it. The current design is in [db-work-queue/README.md](../../../db-work-queue/README.md).
+
 > **Revised after execution:** the branch `db-work-queue/phase-2b` is authoritative. The final review's fixes (`cancel` and `markRunning` ignore ended handles, Javadoc corrections, `describe`, a `ClaimHandleTest` timeout, a redacted `ClaimedItem.toString()`, and the race-test assertion) are in commits `8f8ed3c` and `21f138f` and are not repeated in the task code below. The one exception is the `ItemProcessor.java` block in Task 3, which now matches the branch. The version first executed passed the last persist exception to `log.warn`, which rendered its messages and causes (possibly protected data) and let a throwing `getMessage()` escape `process()`. An abandoned outcome now logs only class names and SQL codes.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

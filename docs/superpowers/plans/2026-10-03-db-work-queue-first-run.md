@@ -1,5 +1,7 @@
 # DB Work Queue First Run Implementation Plan
 
+> **Deprecated (2026-10-03).** This describes the old db-work-queue design, which was deleted and replaced. Don't implement from it. The current design is in [db-work-queue/README.md](../../../db-work-queue/README.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` for native execution, or `superpowers:subagent-driven-development` if selected by the user. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Give the user one command that processes a fresh batch in real Db2, an obvious handler to change, and a short explanation of the ordinary job flow.

@@ -1,5 +1,7 @@
 # Work Queue Phase 2c: QueueRunner Implementation Plan
 
+> **Deprecated (2026-10-03).** This describes the old db-work-queue design, which was deleted and replaced. Don't implement from it. The current design is in [db-work-queue/README.md](../../../db-work-queue/README.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build `QueueRunner` (spec slice 2.5): the poll loop with its permit rule, the renewal loop, the DB-free supervisor, `stop()` and `crash()`, and `QueueRunnerLifecycleTest`. It also lands the items carried over from the Phase 2b review: spec revision 11 (B4 counts `G`; `claimedAt` is the origin of E3 and T2), a renewal round that tells a claim its own task ended from a lost one, a shared diagnostics helper for logging failures, and a thread-safe `ScriptedRepository`.

@@ -1,5 +1,7 @@
 # DB work queue: a working first example
 
+> **Deprecated (2026-10-03).** This describes the old db-work-queue design, which was deleted and replaced. Don't implement from it. The current design is in [db-work-queue/README.md](../../../db-work-queue/README.md).
+
 Status: design approved by the user on 2026-10-03; implemented and verified. See the [implementation and verification record](../plans/2026-10-03-db-work-queue-first-run.md).
 
 ## Outcome

@@ -1,5 +1,7 @@
 # db-work-queue — Design
 
+> **Deprecated (2026-10-03).** This describes the old db-work-queue design, which was deleted and replaced. Don't implement from it. The current design is in [db-work-queue/README.md](../../../db-work-queue/README.md).
+
 Date: 2026-09-21 (revision 13: 2026-10-02)
 Status: Architecture accepted. Phase 1 gate passed (2026-09-25); approved for Phase 2.
 Production approval pending review of this revision. Every time value in §5.3 and §7 is a conditional target

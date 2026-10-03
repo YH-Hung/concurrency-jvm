@@ -1,5 +1,7 @@
 # DB Work Queue Deep Modules Implementation Plan
 
+> **Deprecated (2026-10-03).** This describes the old db-work-queue design, which was deleted and replaced. Don't implement from it. The current design is in [db-work-queue/README.md](../../../db-work-queue/README.md).
+
 > **For agentic workers:** After explicit user approval, use `superpowers:executing-plans` for sequential execution in this chat, or `superpowers:subagent-driven-development` if the user selects delegation. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Status:** Implementation and fresh code review complete; 495 unit tests pass. Db2 integration verification awaits approval to download the required test image.

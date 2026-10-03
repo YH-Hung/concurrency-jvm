@@ -1,5 +1,7 @@
 # Work Queue Phase 2d: Sweeper, Metrics and Health Implementation Plan
 
+> **Deprecated (2026-10-03).** This describes the old db-work-queue design, which was deleted and replaced. Don't implement from it. The current design is in [db-work-queue/README.md](../../../db-work-queue/README.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 > **Executed on branch `db-work-queue/phase-2d`; five review decisions supersede this plan's text.** `sampleBacklog()` ends with `WITH UR` (an uncommitted read, so it never waits for row locks whatever the database's `cur_commit` setting), and its lock IT asserts the uncommitted state. `QueueRunner.deadLoops()` reads each loop thread's `isAlive()` before its run flag, so a loop that stop or `crash()` ended is never reported dead. From the code review (spec revision 13): `deadLoops()` also reports the sweeper and backlog sampler loops, so liveness watches all five; the `BacklogSampler` dates its sample (`backlog.sample_age`) and counts its failures (`backlog.sample.errors`); and `claim.rows` counts claimed rows, which the LostClaimsHigh alert divides `claims.lost` by. Design decisions 1, 8 and 9, the Task 1, 2, 4, 5 and 6 code, and the self-review lines on the default isolation, the LostClaimsHigh ratio and the dead sweeper predate them; the branch's code and spec are authoritative.

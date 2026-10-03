@@ -1,5 +1,7 @@
 # Work Queue Phase 2a: Timing Foundations Implementation Plan
 
+> **Deprecated (2026-10-03).** This describes the old db-work-queue design, which was deleted and replaced. Don't implement from it. The current design is in [db-work-queue/README.md](../../../db-work-queue/README.md).
+
 > **Revised after the final review (spec revision 10):** the code blocks and expected values below match the code on
 > branch `db-work-queue/phase-2`. The version first executed derived E5 from F*, the number of failed rounds survived
 > (`d80f804`); the review corrected E5 to `max(d, L − max(I, W) − 4W − d − G)`.
