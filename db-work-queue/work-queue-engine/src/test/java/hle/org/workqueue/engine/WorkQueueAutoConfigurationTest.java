@@ -61,6 +61,46 @@ class WorkQueueAutoConfigurationTest {
         worker().withPropertyValues("spring.datasource.connection-fetch=lazy")
             .run(c -> { assertThat(c).hasFailed(); assertThat(StartupDatabase.connections).hasValue(0); });
     }
+    private ApplicationContextRunner unconfiguredWorker() {
+        return new ApplicationContextRunner().withUserConfiguration(Application.class)
+            .withBean(ExternalService.class, () -> (key, token, payload, timeout) -> new CallResult("done"))
+            .withPropertyValues("spring.datasource.url=jdbc:queue-test:db", "spring.datasource.driver-class-name=" + StartupDatabase.class.getName(),
+                "spring.datasource.hikari.minimum-idle=0", "spring.sql.init.mode=never");
+    }
+    @Test void absentMaximumUsesEffectiveHikariDefaultForSmallConcurrency() {
+        unconfiguredWorker().withPropertyValues("workqueue.expected-namespace=demo", "workqueue.concurrency=6")
+            .run(c -> {
+                assertThat(c).hasNotFailed();
+                assertThat(c.getBean(HikariDataSource.class).getMaximumPoolSize()).isEqualTo(10);
+            });
+    }
+    @Test void absentMaximumFailsDefaultConcurrencyWithB3BeforeConnection() {
+        unconfiguredWorker().withPropertyValues("workqueue.expected-namespace=demo")
+            .run(c -> {
+                assertThat(c).hasFailed();
+                assertThat(c.getStartupFailure()).hasStackTraceContaining("B3");
+                assertThat(StartupDatabase.connections).hasValue(0);
+            });
+    }
+    @Test void absentNamespaceFailsBeforeConnection() {
+        unconfiguredWorker().withPropertyValues("spring.datasource.hikari.maximum-pool-size=20")
+            .run(c -> {
+                assertThat(c).hasFailed();
+                assertThat(c.getStartupFailure()).hasStackTraceContaining("workqueue.expected-namespace is required");
+                assertThat(StartupDatabase.connections).hasValue(0);
+            });
+    }
+    @Test void twoActualSourcesFailBeforeConnection() {
+        worker().withBean("dataSource", HikariDataSource.class, () -> {
+                var pool = new HikariDataSource();
+                pool.setJdbcUrl("jdbc:queue-test:db"); pool.setMaximumPoolSize(20); return pool;
+            }).withBean("otherDataSource", javax.sql.DataSource.class, HikariDataSource::new)
+            .run(c -> {
+                assertThat(c).hasFailed();
+                assertThat(c.getStartupFailure()).hasStackTraceContaining("exactly one unwrapped HikariDataSource");
+                assertThat(StartupDatabase.connections).hasValue(0);
+            });
+    }
     @Test void invalidNamespaceAndTimingFailBeforeConnection() {
         for (String property : new String[]{"workqueue.expected-namespace=", "workqueue.expected-namespace=bad:name",
                 "workqueue.db.lock-wait=5s", "workqueue.lease-duration=60s", "workqueue.max-processing-time=1s", "workqueue.db-staleness-limit=1s"}) {

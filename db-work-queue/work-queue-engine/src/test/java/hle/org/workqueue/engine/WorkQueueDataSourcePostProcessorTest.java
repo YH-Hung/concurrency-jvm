@@ -23,6 +23,19 @@ class WorkQueueDataSourcePostProcessorTest {
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("before");
         }
     }
+    @Test void rejectsSuppliedAndJndiDriverSourcesWhoseTimeoutsHikariCannotApply() {
+        StartupDatabase.reset();
+        for (boolean supplied : new boolean[]{true, false}) {
+            try (var pool = new HikariDataSource()) {
+                pool.setMaximumPoolSize(20);
+                if (supplied) pool.setDataSource(new DriverManagerDataSource("jdbc:queue-test:db"));
+                else pool.setDataSourceJNDI("java:comp/env/jdbc/workQueue");
+                assertThatThrownBy(() -> processor().postProcessBeforeInitialization(pool, "dataSource"))
+                    .isInstanceOf(IllegalStateException.class).hasMessageContaining("driver timeouts");
+                assertThat(StartupDatabase.connections).hasValue(0);
+            }
+        }
+    }
     @Test void doesNotAlterUnrelatedPools() {
         try (var pool = new HikariDataSource()) {
             long original = pool.getConnectionTimeout();

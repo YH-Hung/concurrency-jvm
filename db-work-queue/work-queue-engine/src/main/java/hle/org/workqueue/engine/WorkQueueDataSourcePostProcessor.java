@@ -18,6 +18,11 @@ final class WorkQueueDataSourcePostProcessor implements BeanPostProcessor, Order
         if (pool.isClosed() || pool.getHikariPoolMXBean() != null) {
             throw new IllegalStateException("Configure the work queue before the Hikari pool starts; use Boot's lazy pool construction");
         }
+        // Hikari does not apply dataSourceProperties to supplied or JNDI-resolved sources.
+        // Accepting them would validate a timing budget whose driver bounds were never installed.
+        if (pool.getDataSource() != null || pool.getDataSourceJNDI() != null) {
+            throw new IllegalStateException("Configure Hikari with jdbcUrl or dataSourceClassName so the work queue can apply driver timeouts; supplied and JNDI datasources are unsupported");
+        }
         WorkQueueProperties p = properties.getObject();
         validate(p);
         p.getDb().toTimeouts().applyTo(pool);

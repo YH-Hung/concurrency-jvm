@@ -26,7 +26,7 @@ total=10 done=10 failed=0 pending=0 claimed=0 missing=0
 Batch complete. Stopping this worker; Db2 remains running for inspection.
 ```
 
-Run the same command again to process a new batch. Earlier jobs and their results remain in Db2.
+Run one invocation at a time. Run the same command again to process a new batch. Earlier jobs and their results remain in Db2.
 Each run prints its directory under `work-queue-demo/target/first-run/`, containing `batch.ids`
 and the build, database, migration, seed, worker and verification logs. A failed step returns nonzero.
 Ctrl-C stops this invocation's child processes. Database readiness is limited to 15 minutes;
@@ -48,7 +48,8 @@ public CallResult call(IdempotencyKey key, long claimToken, String payload, Dura
 ```
 
 Change `processed:` in [ExampleHandler.java](work-queue-demo/src/main/java/hle/org/workqueue/demo/ExampleHandler.java)
-and rerun the script. It rebuilds the jar, and only newly inserted jobs use the new code.
+and rerun the script. It rebuilds the jar. Completed jobs retain their stored results;
+the updated handler processes eligible queued work, including the new batch and any older unfinished jobs.
 A result must fit in **1000 UTF-8 bytes**.
 
 The sample has no external side effects. If your handler sends a payment, message, or another external request,
@@ -102,7 +103,8 @@ and exit. The worker remains alive until Ctrl-C and uses the engine's graceful s
 
 ## Use the engine in your Spring Boot application
 
-Depend on `hle.org:work-queue-engine`, supply one `ExternalService` bean, and configure a datasource:
+Install the local artifacts with `./mvnw install -DskipTests`, then depend on
+`hle.org:work-queue-engine:1.0-SNAPSHOT`. Supply one `ExternalService` bean and configure a datasource:
 
 ```java
 @Bean
@@ -134,7 +136,9 @@ required columns, exactly one matching namespace, UTC database time, and the eng
 before polling. No application code constructs internal engine classes.
 
 The supported datasource is **one unstarted HikariDataSource named `dataSource`**, normally created
-by Boot. Wrapped/lazy proxy pools, already running pools, and multiple datasources are rejected.
+by Boot using a JDBC URL (or `dataSourceClassName`). Wrapped/lazy proxy pools, already running pools,
+multiple datasources, and pools with a supplied or JNDI datasource are rejected. The latter bypass
+Hikari's driver-property configuration, so the engine cannot establish its required timeout bounds.
 The default concurrency is 16, so the pool needs at least 20 connections; Boot's default pool size 10
 is too small. The engine applies bounded JDBC timeouts before the first connection opens.
 

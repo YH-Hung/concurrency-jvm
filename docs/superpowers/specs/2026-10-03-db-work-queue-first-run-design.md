@@ -1,6 +1,6 @@
 # DB work queue: a working first example
 
-Status: design approved by the user on 2026-10-03; implementation plan pending review.
+Status: design approved by the user on 2026-10-03; implemented and verified. See the [implementation and verification record](../plans/2026-10-03-db-work-queue-first-run.md).
 
 ## Outcome
 

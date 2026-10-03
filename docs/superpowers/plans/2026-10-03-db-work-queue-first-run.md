@@ -10,7 +10,7 @@
 
 **Spec:** [Approved first-run design](../specs/2026-10-03-db-work-queue-first-run-design.md). The [original production design](../specs/2026-09-21-db-work-queue-design.md) remains authoritative for existing queue guarantees and pending production gates.
 
-**Status:** Implementation in progress on `codex/db-work-queue-first-run`.
+**Status:** Implemented and verified on `codex/db-work-queue-first-run`.
 
 ## Global Constraints
 
@@ -135,16 +135,54 @@ The processor runs after property binding and Boot JDBC connection-details bindi
 
 **Interfaces:** `FirstRunIT` uses a real Db2 container configured with database `WORKQ`, namespace `demo`, and the same external-package application/auto-discovery as the executable example; it never directly constructs or imports engine implementation types. It owns an isolated database/schema and never uses the engine IT helper that cleans shared test state.
 
-- [ ] Add the real integration scenario: migrate through `DemoCommands`; seed A; start the worker context; verify A; close context; seed B; restart with a fresh owner; verify B and assert A's statuses/results/attempt counts are unchanged. Query the stored example result to assert the actual handler ran. Test worker startup against a missing migration and mismatched namespace, with no jobs claimed.
-- [ ] Run `./mvnw test` and require all unit tests to pass. Obtain the specified Db2 image through the normal authorized Docker workflow; if unavailable, preserve the work and mark real-DB verification incomplete rather than replacing the gate with mocks.
-- [ ] Run `./mvnw verify` for existing and new ITs. Require all available tests to pass; report test counts and failures accurately. This does not count deferred runtime/operations/process/load scenarios as implemented.
-- [ ] Run `./scripts/first-run.sh` twice on the documented local setup. Confirm real output, fresh batches, retained prior work, nonzero failure behavior, and no leftover worker process after each script exits. Keep the database and generated files for the user's inspection.
-- [ ] Rewrite the README's opening around prerequisites → one command → expected counts → `ExampleHandler.java` → enqueue SQL → result query → stopping. Move the implementation-phase status and detailed tests below the quickstart. State any integration verification limitation at the top until resolved.
-- [ ] Rewrite the reading guide around `ItemProcessor.process()` and **insert → claim → handler → persist → release**. Explain persistent completion versus local task cleanup, and persistence retry versus another processing attempt. Put ownership tables, leases, fencing and shutdown after that path. Link to exact source files; do not create another inventory-first guide.
-- [ ] Perform the usability check using only the quickstart: locate/change the example handler, rerun, inspect its stored result, and locate the five steps in source. Restore any temporary verification-only handler edit. Run `git diff --check`; obtain an independent final review and resolve actionable findings. Commit the verified guide and final cleanup.
+- [x] Add the real integration scenario: migrate through `DemoCommands`; seed A; start the worker context; verify A; close context; seed B; restart with a fresh owner; verify B and assert A's statuses/results/attempt counts are unchanged. Query the stored example result to assert the actual handler ran. Test worker startup against a missing migration and mismatched namespace, with no jobs claimed.
+- [x] Run `./mvnw test` and require all unit tests to pass. Obtain the specified Db2 image through the normal authorized Docker workflow; if unavailable, preserve the work and mark real-DB verification incomplete rather than replacing the gate with mocks.
+- [x] Run `./mvnw verify` for existing and new ITs. Require all available tests to pass; report test counts and failures accurately. This does not count deferred runtime/operations/process/load scenarios as implemented.
+- [x] Run `./scripts/first-run.sh` twice on the documented local setup. Confirm real output, fresh batches, retained prior work, nonzero failure behavior, and no leftover worker process after each script exits. Keep the database and generated files for the user's inspection.
+- [x] Rewrite the README's opening around prerequisites → one command → expected counts → `ExampleHandler.java` → enqueue SQL → result query → stopping. Move the implementation-phase status and detailed tests below the quickstart. State any integration verification limitation at the top until resolved.
+- [x] Rewrite the reading guide around `ItemProcessor.process()` and **insert → claim → handler → persist → release**. Explain persistent completion versus local task cleanup, and persistence retry versus another processing attempt. Put ownership tables, leases, fencing and shutdown after that path. Link to exact source files; do not create another inventory-first guide.
+- [x] Perform the usability check using only the quickstart: locate/change the example handler, rerun, inspect its stored result, and locate the five steps in source. Restore any temporary verification-only handler edit. Run `git diff --check`; obtain an independent final review and resolve actionable findings. Commit the verified guide and final cleanup.
 
 ## Handoff and completion
 
 Recommend **native execution in this chat**, followed by one independent final review: these four tasks share startup and command interfaces, and sequential implementation avoids duplicate setup while keeping the first-run goal visible. Use an isolated worktree at execution time based on the reviewed deep-modules branch.
 
 Completion means the actual documented command and repeat run succeed, not just that the classes compile. If image access or Db2 prevents that evidence, report the specific limitation and leave the real-DB acceptance items unchecked.
+
+## Implementation decisions and review
+
+- The managed worktree was outside the writable sandbox, so implementation used the dedicated
+  `codex/db-work-queue-first-run` branch in the existing checkout. The unused managed worktree was archived.
+  This keeps the work isolated in Git, but the checkout remains shared with the user.
+- The independent review identified that supplied/JNDI Hikari datasources bypass driver-property binding.
+  Startup now rejects those modes. The regression test failed before the fix and passed afterward,
+  asserting rejection before any connection attempt. Normal URL/classname construction remains supported.
+- Additional tests now exercise truly absent pool-size/namespace properties and two actual datasources.
+  Hikari 7.0.2 already normalizes its constructor default to 10; no pool-default behavior change was needed.
+- The guide now states that edited handlers process eligible unfinished jobs, including older ones.
+  Completed rows retain their results. No review findings remain deferred.
+- Production admin/security, restricted-role, fault/chaos/process and load gates remain pending as approved.
+  The cost of this scope is that the example does not certify production readiness.
+- Existing queue algorithms and schema remain unchanged; this slice's regression evidence does not claim
+  a new audit of every preexisting algorithm behavior.
+- First-run orchestration supports sequential invocations, as the README now states. Concurrent creation
+  of credentials/manifests is unsupported and would need explicit coordination.
+- If seeding commits but manifest publication fails, the command fails and preserves jobs. Cross-resource
+  recovery is outside this example; locating that batch may require manual database inspection.
+- JDK 25 and the specified amd64 Db2 image remain the supported prerequisites; other platforms are unverified.
+- Maintenance errors stay summarized to preserve redaction; diagnosis may require the guide and local logs.
+
+## Verification record — 2026-10-03
+
+- Final `./mvnw verify`: **524 unit tests + 76 real Db2 integration tests**, zero failures, errors or skips.
+  This includes a fresh worker context, repeated batches, unchanged prior results/attempts, and startup
+  rejection for mismatched namespace and missing migration. Final build succeeded after the review fix.
+- Bash syntax check and process harness: **11 scenarios passed**, covering repeat runs, build/database/
+  maintenance/worker/verification failures, SIGINT, SIGTERM and an unrelated process.
+- Documented command succeeded twice: batches **1–10** and **11–20**, each `total=10 done=10`.
+- Handler-edit walkthrough succeeded: batch **21–30**, ten stored `custom:job-*` results; original source
+  restored and jar rebuilt. The first batch's stored status, attempt count and result remained byte-identical.
+- Real CLI negative check: missing row produced `total=1 done=0 missing=1` and **exit code 1**.
+- No leftover demo worker. Db2 and ignored local credentials/run files are retained for inspection.
+- README/source links and `git diff --check` passed. One independent final review completed; its important
+  datasource-timeout finding was reproduced, fixed, and verified. No actionable review findings remain.
