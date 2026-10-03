@@ -1,0 +1,28 @@
+spring:
+  main:
+    banner-mode: off
+  datasource:
+    url: ${WORKQUEUE_JDBC_URL:jdbc:db2://127.0.0.1:50000/WORKQ}
+    username: ${WORKQUEUE_DB_USER:db2inst1}
+    password: ${WORKQUEUE_DB_PASSWORD:}
+    driver-class-name: com.ibm.db2.jcc.DB2Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 0
+      connection-timeout: 2000
+      validation-timeout: 1000
+      connection-init-sql: SET CURRENT LOCK TIMEOUT 3
+      data-source-properties:
+        loginTimeout: 3
+        blockingReadConnectionTimeout: 8
+        queryTimeoutInterruptProcessingMode: 2
+  flyway:
+    enabled: false
+  sql:
+    init:
+      mode: never
+logging:
+  level:
+    root: WARN
+workqueue:
+  expected-namespace: ${WORKQUEUE_NAMESPACE:demo}

@@ -19,6 +19,7 @@
 
     <modules>
         <module>work-queue-engine</module>
+        <module>work-queue-demo</module>
     </modules>
 
     <properties>
