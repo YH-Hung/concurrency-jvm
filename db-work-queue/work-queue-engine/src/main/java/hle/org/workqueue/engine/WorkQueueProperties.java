@@ -7,10 +7,15 @@ import java.time.Duration;
 /**
  * Engine settings, bound from {@code workqueue.*} (spec §6). Every default is the spec's default column.
  * {@link TimingBudget#check} validates the timing constraints between them at startup. Settings used only by
- * later phases (expected-namespace, admin) arrive with the components that read them.
+ * later phases (admin) arrive with the components that read them.
  */
 @ConfigurationProperties("workqueue")
 public class WorkQueueProperties {
+
+    private String expectedNamespace;
+
+    public String getExpectedNamespace() { return expectedNamespace; }
+    public void setExpectedNamespace(String value) { expectedNamespace = value; }
 
     private int concurrency = 16;
     private int claimBatchSize = 20;
