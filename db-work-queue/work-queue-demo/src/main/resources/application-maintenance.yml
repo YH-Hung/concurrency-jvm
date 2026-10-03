@@ -1,5 +1,0 @@
-spring:
-  main:
-    keep-alive: false
-  autoconfigure:
-    exclude: hle.org.workqueue.engine.WorkQueueAutoConfiguration
