@@ -1,63 +1,110 @@
 # db-work-queue
 
-A Db2 table used as a work queue. Run as many instances as you like. They coordinate only through the table, keep
-working through crashes, and retry failed jobs.
+A work queue stored in a shared Db2 table. Multiple app instances can process it together.
 
-The whole mechanism is [`WorkQueue.java`](src/main/java/hle/org/workqueue/WorkQueue.java) (three SQL statements and
-a worker loop) and [`schema.sql`](src/main/resources/schema.sql).
+**You provide the jobs and the business logic. `WorkQueue` manages their execution.**
 
-## How it works
+| Part | Responsibility |
+|---|---|
+| You: setup | Configure the Db2 connection and create the table. |
+| You: producer | Insert jobs with an operation ID and payload. |
+| You: handler | Process the payload safely, even if called again. |
+| `WorkQueue` | Claim jobs, limit concurrency, manage leases and retries, and record success or failure. |
 
-Each instance runs `workers` virtual threads. Each thread loops: **claim → handle → save the outcome.**
+Each worker repeats: **claim one row → call your handler → save the result**.
 
-| Step | SQL | Why it's safe |
-|---|---|---|
-| Claim | Lease the oldest row with `AVAILABLE_AT <= now`: `STATUS='CLAIMED'`, `ATTEMPTS+1`, `AVAILABLE_AT = now + lease` | One statement with `SKIP LOCKED DATA`, so two workers never take the same row |
-| Success | `DONE`, `AVAILABLE_AT = NULL` | Fenced: `WHERE ID = ? AND ATTEMPTS = <this claim's value> AND STATUS = 'CLAIMED'` |
-| Failure | `PENDING` again after `retry-backoff`. `FAILED` at `max-attempts` | Fenced the same way |
-| Crash or hang | Nothing: the lease runs out, so the row can be claimed again. A handler still running at that point is interrupted and the attempt fails | A late write from the old worker updates 0 rows |
+## Your handler
 
-`ATTEMPTS` rises with every claim and is never reset, so it also serves as the fencing token. If the last attempt
-crashes, the next claim sets the row to `FAILED` without running the job again.
+Replace the logging lambda in [`App.java`](src/main/java/hle/org/workqueue/App.java) with your business logic.
+It receives `(operationId, payload)`: a stable job ID and the payload string you inserted.
 
-**Delivery is at-least-once.** A crash after the handler finishes runs the job again, and so does a handler that
-outlives its lease. Make its effects idempotent on `operationId`.
+- **Return normally:** the queue marks the job `DONE`.
+- **Throw:** the queue retries after `retry-backoff`, or marks it `FAILED` if attempts are exhausted.
+- **Make repeated calls safe:** use `operationId` to prevent duplicate effects. For example, retrying
+  `order-123` must not create a second order. This is called *idempotency*.
+- **Set timeouts on downstream calls and stop when interrupted:** propagate `InterruptedException` or check
+  interruption in long loops. The queue interrupts a handler when its lease ends; it cannot force it to stop.
 
-**Handlers must bound their downstream calls with timeouts and stop when interrupted.** `workers` is a hard
-concurrency limit, so a handler that ignores the interrupt keeps its worker until it returns. If every worker on an
-instance is stuck, that instance stops claiming, and its rows wait for a free worker on another instance. More
-workers only delay the stall.
+**A job can run more than once**, even after the business operation succeeds: the app might crash before saving
+`DONE`. This is *at-least-once delivery*. The table's unique operation ID prevents duplicate inserts;
+your handler must prevent duplicate business effects.
 
-## Use
+## Run
 
-1. Apply `schema.sql`. Db2 must run in UTC, because leases use the database clock.
-2. Put your job in the handler in [`App.java`](src/main/java/hle/org/workqueue/App.java). To retry, throw.
-3. Set `SPRING_DATASOURCE_URL`, `SPRING_DATASOURCE_USERNAME` and `SPRING_DATASOURCE_PASSWORD`, then run
-   `./mvnw spring-boot:run` on as many machines as you like. Stopping with SIGTERM lets running jobs finish (up to
-   30s).
+Requires Java 25 and Db2.
 
-Producers enqueue with `INSERT INTO WORK_ITEM (OPERATION_ID, PAYLOAD) VALUES (?, ?)`. A duplicate `OPERATION_ID`
-fails with SQLSTATE 23505, meaning the job is already enqueued.
+1. Apply [`schema.sql`](src/main/resources/schema.sql) to Db2. Run Db2 in UTC so daylight-saving changes cannot
+   shift leases and retries.
+2. Implement the handler above.
+3. Set `SPRING_DATASOURCE_URL`, `SPRING_DATASOURCE_USERNAME`, and `SPRING_DATASOURCE_PASSWORD`.
+4. From `db-work-queue`, run `./mvnw spring-boot:run`. Spring starts the queue automatically. Run more instances
+   against the same table to add workers.
 
-| Property | Default | |
-|---|---|---|
-| `workqueue.workers` | 16 | concurrent jobs per instance |
-| `workqueue.lease` | 60s | how long a claim lasts, and so the handler's timeout |
-| `workqueue.max-attempts` | 5 | |
-| `workqueue.retry-backoff` | 30s | |
-| `workqueue.poll-interval` | 1s | how long an idle worker sleeps between claims |
-
-## Check what's in the queue
+Your producer enqueues a job with:
 
 ```sql
+INSERT INTO WORK_ITEM (OPERATION_ID, PAYLOAD) VALUES (?, ?);
+```
+
+A duplicate `OPERATION_ID` fails with SQLSTATE `23505`: that job is already in the table.
+
+## Settings
+
+**Queue settings are optional.** [`App.java`](src/main/java/hle/org/workqueue/App.java) registers
+`WorkQueue.Settings` through `@EnableConfigurationProperties`. Spring reads `workqueue.*` properties,
+uses each field's `@DefaultValue` in [`WorkQueue.java`](src/main/java/hle/org/workqueue/WorkQueue.java) when
+that property is missing, and injects the settings into the queue bean. Invalid values fail startup.
+
+| Property | Default | Meaning |
+|---|---|---|
+| `workqueue.workers` | `16` | Maximum concurrent handlers per instance. |
+| `workqueue.lease` | `60s` | How long a claim lasts; also the handler's time budget, including time spent claiming. |
+| `workqueue.max-attempts` | `5` | Attempt budget per job, including the first claim. Crashes also consume attempts. |
+| `workqueue.retry-backoff` | `30s` | Fixed delay after a failed handler attempt. |
+| `workqueue.poll-interval` | `1s` | Wait between claims when the queue is empty or a database call fails. |
+
+Override only what you need in [`application.properties`](src/main/resources/application.properties):
+
+```properties
+workqueue.workers=8
+workqueue.lease=120s
+```
+
+Choose a lease longer than a legitimate job plus its claim time. A shorter lease interrupts slow jobs;
+a longer lease delays recovery after a crash.
+
+## Failure and recovery
+
+| Event | What the queue does |
+|---|---|
+| Handler exceeds its lease | Interrupts it and treats the timeout as a failed attempt once it stops. The expired row can be claimed again. |
+| Handler ignores interruption | Waits for it, keeping that worker occupied. Another worker may run the expired job again. |
+| App crashes, or saving `DONE` fails | Reclaims the row after its lease expires. If the attempt budget is exhausted, marks it `FAILED` without calling the handler again. |
+| An old worker saves after a newer claim | Rejects the old outcome by checking the claim's `ATTEMPTS` value. This protects queue state; the handler protects business effects. |
+| Database call fails | Logs the error, waits `poll-interval`, and tries again. |
+| App receives SIGTERM | Stops claiming, allows up to 30s for running jobs, then interrupts remaining handlers. |
+
+Claims use `SKIP LOCKED DATA` to skip rows locked by other workers. Each claim commits before the handler runs.
+`AVAILABLE_AT` determines when a row can be claimed: enqueue time, retry time, or lease expiry;
+`DONE` and `FAILED` rows have no next claim time. No cleanup job is needed to recover expired claims.
+
+## Limits and checks
+
+- Jobs are claimed roughly oldest available first; they can finish out of order.
+- All jobs share the same lease duration.
+- `PAYLOAD` and `LAST_ERROR` allow 1000 bytes; `OPERATION_ID` allows 64 bytes.
+- `DONE` and `FAILED` rows remain in the table. Deleting one allows its operation ID to be enqueued again.
+
+```sql
+-- Counts by state
 SELECT STATUS, COUNT(*) FROM WORK_ITEM GROUP BY STATUS;
-SELECT * FROM WORK_ITEM WHERE STATUS = 'FAILED';
+
+-- Jobs that exhausted their attempts
+SELECT OPERATION_ID, ATTEMPTS, LAST_ERROR FROM WORK_ITEM WHERE STATUS = 'FAILED';
 ```
 
-## Test
+From `db-work-queue`, run `./mvnw test`. Docker is required: the tests start Db2 and check concurrent processing,
+retries, interruption, crash recovery, rejection of stale outcomes, and lifecycle concurrency limits.
 
-```bash
-./mvnw test
-```
-
-This needs Docker. The test starts Db2 itself, which takes a few minutes on Apple Silicon.
+For diagrams and implementation details, see the [visual walkthrough](../docs/db-work-queue-design.html).
+The [earlier engine design](../docs/superpowers/specs/2026-09-21-db-work-queue-design.md) is deprecated.

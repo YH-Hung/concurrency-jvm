@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>DB Work Queue Design</title>
+<style>
+:root {
+  --bg:#f8fafc; --surface:#fff; --surface-2:#f1f5f9; --border:#e2e8f0;
+  --text:#1e293b; --muted:#64748b;
+  --primary:#2563eb; --primary-strong:#1d4ed8; --primary-soft:#dbeafe;
+  --success:#16a34a; --success-soft:#dcfce7;
+  --danger:#dc2626; --danger-soft:#fee2e2;
+  --warning:#b45309; --warning-soft:#fef3c7;
+  --code-bg:#0f172a; --code-text:#e2e8f0;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:#0b1120; --surface:#111827; --surface-2:#1e293b; --border:#334155;
+    --text:#e2e8f0; --muted:#94a3b8;
+    --primary:#60a5fa; --primary-strong:#93c5fd; --primary-soft:#1e3a5f;
+    --success:#4ade80; --success-soft:#14361f;
+    --danger:#f87171; --danger-soft:#3f1a1a;
+    --warning:#fbbf24; --warning-soft:#3b2f12;
+    --code-bg:#020617; --code-text:#e2e8f0;
+  }
+}
+:root[data-theme="dark"] {
+  --bg:#0b1120; --surface:#111827; --surface-2:#1e293b; --border:#334155;
+  --text:#e2e8f0; --muted:#94a3b8;
+  --primary:#60a5fa; --primary-strong:#93c5fd; --primary-soft:#1e3a5f;
+  --success:#4ade80; --success-soft:#14361f;
+  --danger:#f87171; --danger-soft:#3f1a1a;
+  --warning:#fbbf24; --warning-soft:#3b2f12;
+  --code-bg:#020617; --code-text:#e2e8f0;
+}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);line-height:1.6;}
+main{max-width:1100px;margin:0 auto;padding:32px 16px 48px;}
+header{text-align:center;margin-bottom:24px;}
+h1{font-size:2.2em;color:var(--primary-strong);line-height:1.2;}
+.subtitle{color:var(--muted);font-size:1.1em;margin-top:8px;}
+nav{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin:20px 0 32px;}
+nav a{color:var(--primary);text-decoration:none;font-size:.9em;padding:4px 12px;border:1px solid var(--border);border-radius:999px;background:var(--surface);}
+nav a:hover{border-color:var(--primary);}
+section{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:32px;margin-bottom:24px;}
+h2{font-size:1.6em;color:var(--primary);border-bottom:2px solid var(--primary);padding-bottom:10px;margin-bottom:20px;}
+h3{font-size:1.15em;margin:28px 0 12px;}
+p{margin:12px 0;}
+a{color:var(--primary);}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9em;background:var(--surface-2);padding:1px 5px;border-radius:4px;}
+pre{background:var(--code-bg);color:var(--code-text);padding:20px;border-radius:8px;overflow-x:auto;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85em;line-height:1.5;margin:12px 0;}
+pre code{background:none;padding:0;font-size:1em;color:inherit;}
+ul,ol{margin:12px 0 12px 24px;}
+li{margin:4px 0;}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin:16px 0;}
+.card{background:var(--surface-2);padding:20px;border-radius:8px;border-left:4px solid var(--primary);}
+.card h3{margin:0 0 8px;color:var(--primary-strong);font-size:1.05em;}
+.card p{margin:0;}
+.note{background:var(--primary-soft);border-left:4px solid var(--primary);padding:14px 16px;margin:20px 0;border-radius:0 8px 8px 0;}
+.warn{background:var(--warning-soft);border-left:4px solid var(--warning);padding:14px 16px;margin:20px 0;border-radius:0 8px 8px 0;}
+.note p,.warn p{margin:4px 0;}
+.table-wrap{overflow-x:auto;margin:16px 0;}
+table{width:100%;border-collapse:collapse;font-size:.95em;}
+th,td{padding:10px 14px;text-align:left;border-bottom:1px solid var(--border);vertical-align:top;}
+th{background:var(--surface-2);font-weight:600;}
+figure{margin:20px 0;overflow-x:auto;}
+figure svg{display:block;width:100%;height:auto;min-width:640px;color:var(--text);}
+figcaption{color:var(--muted);font-size:.9em;margin-top:10px;text-align:center;}
+svg text{fill:currentColor;font-size:12px;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;}
+svg .lbl{font-size:11px;}
+svg .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+svg .b{font-weight:600;}
+svg .muted{fill:var(--muted);}
+svg .box{fill:var(--surface);stroke:currentColor;stroke-width:1.5;}
+svg .db{fill:var(--surface-2);stroke:currentColor;stroke-width:1.5;}
+svg .line{stroke:currentColor;stroke-width:1.5;fill:none;}
+svg .guide{stroke:var(--muted);stroke-width:1;stroke-dasharray:3 4;}
+svg .gone{fill:none;stroke:var(--muted);stroke-width:1.2;stroke-dasharray:5 4;}
+svg .claimed{fill:var(--primary-soft);stroke:var(--primary);stroke-width:1.5;}
+svg .done{fill:var(--success-soft);stroke:var(--success);stroke-width:1.5;}
+svg .failed{fill:var(--danger-soft);stroke:var(--danger);stroke-width:1.5;}
+svg .pending{fill:var(--surface);stroke:currentColor;stroke-width:1.5;}
+svg .cut{stroke:var(--danger);stroke-width:3;}
+footer{text-align:center;color:var(--muted);font-size:.9em;padding:16px;}
+@media (max-width:640px){
+  section{padding:20px 16px;}
+  h1{font-size:1.7em;}
+  h2{font-size:1.3em;}
+  th,td{padding:8px 10px;}
+}
+</style>
+</head>
+<body>
+<main>
+
+<header>
+<h1>DB Work Queue</h1>
+<p class="subtitle">A Db2 table as a work queue: lease a row, run the job, write the outcome fenced on the attempt.<br>Two Java files, three SQL statements, no coordinator.</p>
+</header>
+
+<nav>
+<a href="#architecture">Architecture</a>
+<a href="#sql">Three statements</a>
+<a href="#states">Row lifecycle</a>
+<a href="#lease">Lease = timeout</a>
+<a href="#failures">Failures</a>
+<a href="#config">Configuration</a>
+<a href="#evolution">Evolution</a>
+<a href="#operate">Run &amp; check</a>
+</nav>
+
+<!-- Architecture -->
+<section id="architecture">
+<h2>Architecture</h2>
+
+<figure>
+<svg viewBox="0 0 760 375" role="img" aria-label="Producers insert rows into the WORK_ITEM table. Three instances with 16, 8 and 32 workers each claim rows with SKIP LOCKED DATA and write outcomes fenced on ATTEMPTS. Instances never talk to each other.">
+<defs><marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+<rect class="box" x="280" y="10" width="200" height="44" rx="8"/>
+<text x="380" y="37" text-anchor="middle" class="b">Producers</text>
+<line class="line" x1="380" y1="54" x2="380" y2="96" marker-end="url(#a1)"/>
+<text x="392" y="80" class="lbl mono">INSERT (OPERATION_ID, PAYLOAD)</text>
+
+<rect class="db" x="230" y="100" width="300" height="96" rx="8"/>
+<text x="380" y="126" text-anchor="middle" class="b mono">WORK_ITEM (Db2)</text>
+<rect class="pending" x="240" y="146" width="64" height="28" rx="14"/>
+<text x="272" y="164" text-anchor="middle" class="lbl mono">PENDING</text>
+<rect class="claimed" x="312" y="146" width="64" height="28" rx="14"/>
+<text x="344" y="164" text-anchor="middle" class="lbl mono">CLAIMED</text>
+<rect class="done" x="384" y="146" width="64" height="28" rx="14"/>
+<text x="416" y="164" text-anchor="middle" class="lbl mono">DONE</text>
+<rect class="failed" x="456" y="146" width="64" height="28" rx="14"/>
+<text x="488" y="164" text-anchor="middle" class="lbl mono">FAILED</text>
+
+<line class="line" x1="130" y1="260" x2="298" y2="199" marker-end="url(#a1)"/>
+<line class="line" x1="380" y1="260" x2="380" y2="199" marker-end="url(#a1)"/>
+<line class="line" x1="630" y1="260" x2="462" y2="199" marker-end="url(#a1)"/>
+<text x="20" y="222" class="lbl mono">CLAIM … SKIP LOCKED DATA</text>
+<text x="392" y="236" class="lbl">one row per claim</text>
+<text x="740" y="222" text-anchor="end" class="lbl mono">FINISH / RETRY, fenced</text>
+<text x="740" y="236" text-anchor="end" class="lbl mono">on ATTEMPTS</text>
+
+<rect class="box" x="20" y="260" width="220" height="80" rx="8"/>
+<text x="130" y="286" text-anchor="middle" class="b">Instance A</text>
+<text x="130" y="306" text-anchor="middle" class="lbl muted">workers = 16</text>
+<text x="130" y="326" text-anchor="middle" class="lbl">claim → handle → save</text>
+<rect class="box" x="270" y="260" width="220" height="80" rx="8"/>
+<text x="380" y="286" text-anchor="middle" class="b">Instance B</text>
+<text x="380" y="306" text-anchor="middle" class="lbl muted">workers = 8</text>
+<text x="380" y="326" text-anchor="middle" class="lbl">claim → handle → save</text>
+<rect class="box" x="520" y="260" width="220" height="80" rx="8"/>
+<text x="630" y="286" text-anchor="middle" class="b">Instance C</text>
+<text x="630" y="306" text-anchor="middle" class="lbl muted">workers = 32</text>
+<text x="630" y="326" text-anchor="middle" class="lbl">claim → handle → save</text>
+<text x="380" y="366" text-anchor="middle" class="lbl muted">Instances never talk to each other. The table is the only shared state.</text>
+</svg>
+<figcaption>Every instance runs the same loop against the same table. Adding or removing an instance needs no registration or rebalancing.</figcaption>
+</figure>
+
+<h3>Key design decisions</h3>
+<div class="grid">
+<div class="card"><h3>No coordinator</h3><p>No broker, no membership, no sweeper. <code>SKIP LOCKED DATA</code> lets competing workers pass over each other's rows instead of waiting.</p></div>
+<div class="card"><h3>A lease, not a held lock</h3><p>The claim commits at once. No lock or connection is held while the handler runs; ownership ends when <code>AVAILABLE_AT</code> passes.</p></div>
+<div class="card"><h3>Fenced outcomes</h3><p><code>ATTEMPTS</code> rises with every claim and is never reset. Outcome writes require this claim's value, so a stale worker's write updates 0 rows (and is logged).</p></div>
+<div class="card"><h3>At-least-once</h3><p>A crash after the handler, or a handler that outlives its lease, runs the job again. Handlers must be idempotent on <code>operationId</code>.</p></div>
+<div class="card"><h3>Virtual threads</h3><p>One virtual thread per worker and one per running handler, so blocking JDBC and downstream calls cost no platform thread. <code>workers</code> still caps concurrency.</p></div>
+</div>
+</section>
+
+<!-- SQL -->
+<section id="sql">
+<h2>The core: three SQL statements</h2>
+<p>This is all the SQL in <a href="../db-work-queue/src/main/java/hle/org/workqueue/WorkQueue.java"><code>WorkQueue.java</code></a>. Recovery from crashes needs no statement of its own.</p>
+
+<h3>1. CLAIM: lease the oldest available row</h3>
+<pre><code>SELECT ID, OPERATION_ID, PAYLOAD, ATTEMPTS FROM FINAL TABLE (
+  UPDATE (SELECT ID, OPERATION_ID, PAYLOAD, STATUS, ATTEMPTS, AVAILABLE_AT FROM WORK_ITEM
+           WHERE AVAILABLE_AT &lt;= CURRENT TIMESTAMP ORDER BY AVAILABLE_AT FETCH FIRST 1 ROW ONLY)
+     SET STATUS = 'CLAIMED', ATTEMPTS = ATTEMPTS + 1,
+         AVAILABLE_AT = CURRENT TIMESTAMP + CAST(:lease AS DECIMAL(18, 3)) SECONDS)
+SKIP LOCKED DATA</code></pre>
+<p><strong>Why it's safe:</strong> select, update and read-back are one statement, and rows another claimer has locked are skipped, so two workers never take the same row. <code>AVAILABLE_AT &lt;= now</code> matches new rows, retries whose backoff is over, and <code>CLAIMED</code> rows whose lease ran out, which is how crashed work comes back. The returned <code>ATTEMPTS</code> is this claim's fencing token.</p>
+
+<h3>2. RETRY: the handler failed and attempts are left</h3>
+<pre><code>UPDATE WORK_ITEM
+   SET STATUS = 'PENDING', LAST_ERROR = :error,
+       AVAILABLE_AT = CURRENT TIMESTAMP + CAST(:backoff AS DECIMAL(18, 3)) SECONDS
+ WHERE ID = :id AND ATTEMPTS = :attempts AND STATUS = 'CLAIMED'</code></pre>
+
+<h3>3. FINISH: DONE, or FAILED on the last attempt</h3>
+<pre><code>UPDATE WORK_ITEM
+   SET STATUS = :status, LAST_ERROR = :error, AVAILABLE_AT = NULL
+ WHERE ID = :id AND ATTEMPTS = :attempts AND STATUS = 'CLAIMED'</code></pre>
+<p><strong>Why it's safe:</strong> if the lease ran out and another worker claimed the row, <code>ATTEMPTS</code> has moved on and the write updates 0 rows. The worker logs that it lost its lease and moves to the next job.</p>
+
+<h3>Schema</h3>
+<div class="table-wrap">
+<table>
+<tr><th>Column</th><th>Type and constraints</th><th>Role</th></tr>
+<tr><td><code>ID</code></td><td><code>BIGINT</code> identity, primary key</td><td>Row identity, part of every fenced write</td></tr>
+<tr><td><code>OPERATION_ID</code></td><td><code>VARCHAR(64) NOT NULL UNIQUE</code></td><td>Idempotency key. A duplicate insert fails with SQLSTATE 23505</td></tr>
+<tr><td><code>PAYLOAD</code></td><td><code>VARCHAR(1000) NOT NULL</code></td><td>Passed to the handler</td></tr>
+<tr><td><code>STATUS</code></td><td><code>VARCHAR(7)</code>, one of <code>PENDING</code>, <code>CLAIMED</code>, <code>DONE</code>, <code>FAILED</code></td><td>Current state</td></tr>
+<tr><td><code>AVAILABLE_AT</code></td><td><code>TIMESTAMP</code>, default now, indexed. <code>NULL</code> only when <code>DONE</code> or <code>FAILED</code></td><td>Claimable from. While <code>CLAIMED</code>, the lease end</td></tr>
+<tr><td><code>ATTEMPTS</code></td><td><code>INTEGER NOT NULL DEFAULT 0</code></td><td>+1 per claim, never reset: the fencing token</td></tr>
+<tr><td><code>LAST_ERROR</code></td><td><code>VARCHAR(1000)</code></td><td>Latest failure, cut to 300 characters</td></tr>
+</table>
+</div>
+
+<h3>Invariants</h3>
+<ul>
+<li><strong><code>ATTEMPTS</code> only goes up.</strong> Each claim gets a value no other claim of that row ever had.</li>
+<li><strong><code>AVAILABLE_AT</code> is <code>NULL</code> exactly when the row is finished.</strong> A <code>CHECK</code> enforces it, and finished rows never match the claim.</li>
+<li><strong>The lease is the handler's timeout.</strong> A handler still running when it ends is interrupted and the attempt fails.</li>
+</ul>
+</section>
+
+<!-- States -->
+<section id="states">
+<h2>Row lifecycle</h2>
+
+<figure>
+<svg viewBox="0 0 760 275" role="img" aria-label="State machine: INSERT creates a PENDING row. A claim moves it to CLAIMED and adds one to ATTEMPTS. From CLAIMED: handler returned goes to DONE; failed with attempts left goes back to PENDING after the retry backoff; the last attempt failing, or its lease running out, goes to FAILED; a lease running out otherwise leads to the row being claimed again.">
+<defs><marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+<circle cx="24" cy="150" r="5" fill="currentColor"/>
+<line class="line" x1="30" y1="150" x2="68" y2="150" marker-end="url(#a2)"/>
+<text x="47" y="140" text-anchor="middle" class="lbl">INSERT</text>
+
+<rect class="pending" x="70" y="125" width="130" height="50" rx="8"/>
+<text x="135" y="155" text-anchor="middle" class="b mono">PENDING</text>
+<rect class="claimed" x="320" y="125" width="130" height="50" rx="8"/>
+<text x="385" y="155" text-anchor="middle" class="b mono">CLAIMED</text>
+<rect class="done" x="610" y="40" width="130" height="50" rx="8"/>
+<text x="675" y="70" text-anchor="middle" class="b mono">DONE</text>
+<rect class="failed" x="610" y="210" width="130" height="50" rx="8"/>
+<text x="675" y="240" text-anchor="middle" class="b mono">FAILED</text>
+
+<line class="line" x1="200" y1="150" x2="318" y2="150" marker-end="url(#a2)"/>
+<text x="260" y="141" text-anchor="middle" class="lbl">claim · ATTEMPTS+1</text>
+
+<path class="line" d="M375,175 C375,235 135,235 135,177" marker-end="url(#a2)"/>
+<text x="255" y="250" text-anchor="middle" class="lbl">failed, attempts left · waits retry-backoff</text>
+
+<path class="line" d="M362,125 C352,70 418,70 408,123" marker-end="url(#a2)"/>
+<text x="385" y="64" text-anchor="middle" class="lbl">lease ran out: claimed again</text>
+
+<line class="line" x1="450" y1="140" x2="608" y2="72" marker-end="url(#a2)"/>
+<text x="528" y="128" class="lbl">handler returned</text>
+
+<line class="line" x1="450" y1="160" x2="608" y2="228" marker-end="url(#a2)"/>
+<text x="530" y="166" class="lbl">last attempt failed,</text>
+<text x="530" y="180" class="lbl">or its lease ran out</text>
+</svg>
+<figcaption><code>DONE</code> and <code>FAILED</code> are final. A last attempt whose lease ran out is failed by the next claim, without running the handler again.</figcaption>
+</figure>
+
+<div class="table-wrap">
+<table>
+<tr><th>From</th><th>Trigger</th><th>To</th><th>Statement</th></tr>
+<tr><td>none</td><td>Producer inserts</td><td><code>PENDING</code></td><td><code>INSERT</code></td></tr>
+<tr><td><code>PENDING</code>, or <code>CLAIMED</code> with an expired lease</td><td>A worker claims it (<code>AVAILABLE_AT &lt;= now</code>)</td><td><code>CLAIMED</code>, <code>ATTEMPTS + 1</code></td><td>CLAIM</td></tr>
+<tr><td><code>CLAIMED</code></td><td>Handler returns</td><td><code>DONE</code></td><td>FINISH</td></tr>
+<tr><td><code>CLAIMED</code></td><td>Handler throws or times out, <code>ATTEMPTS &lt; max-attempts</code></td><td><code>PENDING</code>, claimable after <code>retry-backoff</code></td><td>RETRY</td></tr>
+<tr><td><code>CLAIMED</code></td><td>Handler throws or times out, <code>ATTEMPTS = max-attempts</code></td><td><code>FAILED</code></td><td>FINISH</td></tr>
+<tr><td><code>CLAIMED</code> with an expired lease</td><td>The claim's new <code>ATTEMPTS</code> exceeds <code>max-attempts</code></td><td><code>FAILED</code>, handler not run</td><td>CLAIM, then FINISH</td></tr>
+</table>
+</div>
+
+<h3>One row's life</h3>
+<p><code>max-attempts=3</code>, <code>lease=60s</code>, <code>retry-backoff=30s</code>:</p>
+<div class="table-wrap">
+<table>
+<tr><th>Time</th><th>Event</th><th>STATUS</th><th>ATTEMPTS</th><th>AVAILABLE_AT</th></tr>
+<tr><td>10:00:00</td><td>Producer inserts</td><td><code>PENDING</code></td><td>0</td><td>10:00:00</td></tr>
+<tr><td>10:00:01</td><td>Worker A claims</td><td><code>CLAIMED</code></td><td>1</td><td>10:01:01</td></tr>
+<tr><td>10:00:04</td><td>A's handler throws</td><td><code>PENDING</code></td><td>1</td><td>10:00:34</td></tr>
+<tr><td>10:00:34</td><td>Worker B claims</td><td><code>CLAIMED</code></td><td>2</td><td>10:01:34</td></tr>
+<tr><td>10:00:40</td><td>B's machine freezes</td><td><code>CLAIMED</code></td><td>2</td><td>10:01:34</td></tr>
+<tr><td>10:01:34</td><td>Worker C claims the expired lease</td><td><code>CLAIMED</code></td><td>3</td><td>10:02:34</td></tr>
+<tr><td>10:01:37</td><td>C's handler returns</td><td><code>DONE</code></td><td>3</td><td><code>NULL</code></td></tr>
+</table>
+</div>
+<div class="note"><p><strong>The fence at work:</strong> if B wakes up afterwards and writes its outcome, the write requires <code>ATTEMPTS = 2</code> and so changes nothing. If C had crashed too, the next claim would set <code>ATTEMPTS = 4</code>, see it is past <code>max-attempts</code>, and write <code>FAILED</code>.</p></div>
+</section>
+
+<!-- Lease -->
+<section id="lease">
+<h2>The lease is also the handler's timeout</h2>
+
+<figure>
+<svg viewBox="0 0 780 200" role="img" aria-label="Timeline. The worker starts its countdown at t0, before sending the claim. Db2 runs the claim at t1 and holds the lease until t1 plus lease. The worker interrupts the handler at t0 plus lease, which is earlier, so its FINISH or RETRY write lands while the row is still held. After t1 plus lease the row is claimable again.">
+<defs><marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+<text x="10" y="75" class="b">worker</text>
+<text x="10" y="91" class="lbl muted">JVM clock</text>
+<text x="10" y="155" class="b">row</text>
+<text x="10" y="171" class="lbl muted">Db2 clock</text>
+
+<line class="guide" x1="120" y1="30" x2="120" y2="190"/>
+<line class="guide" x1="170" y1="30" x2="170" y2="190"/>
+<line class="guide" x1="560" y1="30" x2="560" y2="190"/>
+<line class="guide" x1="610" y1="30" x2="610" y2="190"/>
+
+<text x="124" y="40" class="lbl">t₀: countdown starts</text>
+<text x="556" y="40" text-anchor="end" class="lbl">interrupt at t₀ + lease</text>
+
+<line class="line" x1="120" y1="71" x2="180" y2="71" stroke-dasharray="4 3"/>
+<rect class="claimed" x="180" y="62" width="380" height="18" rx="3"/>
+<text x="370" y="75" text-anchor="middle" class="lbl">handler runs</text>
+<line class="cut" x1="560" y1="54" x2="560" y2="88"/>
+
+<line class="line" x1="122" y1="80" x2="168" y2="140" marker-end="url(#a3)"/>
+<text x="134" y="112" text-anchor="end" class="lbl mono">CLAIM</text>
+<line class="line" x1="572" y1="80" x2="572" y2="140" marker-end="url(#a3)"/>
+<text x="580" y="114" class="lbl mono">FINISH / RETRY</text>
+
+<rect class="claimed" x="170" y="142" width="440" height="18" rx="3"/>
+<text x="390" y="155" text-anchor="middle" class="lbl mono">CLAIMED · lease held</text>
+<rect class="gone" x="610" y="142" width="150" height="18" rx="3"/>
+<text x="685" y="155" text-anchor="middle" class="lbl">claimable again</text>
+
+<text x="174" y="187" class="lbl">t₁: AVAILABLE_AT = t₁ + lease</text>
+<text x="614" y="187" class="lbl">t₁ + lease: lease ends</text>
+</svg>
+<figcaption>The worker's countdown starts before the claim is sent, so it always ends before Db2's lease does. The gap between the two is the claim's round trip.</figcaption>
+</figure>
+
+<ul>
+<li>A handler that stops when interrupted gets its outcome written while the row is still its own.</li>
+<li>A handler that ignores the interrupt keeps its worker busy. Once Db2's lease ends, another worker can run the job again, and the old outcome write updates 0 rows.</li>
+<li>If claiming itself took the whole lease, the handler is not started. The row waits out its lease as if the worker had crashed.</li>
+</ul>
+<div class="warn"><p><strong>Db2 must run in UTC.</strong> Leases and backoffs use only the database clock, so app machines' clocks don't matter. But <code>CURRENT TIMESTAMP</code> is local time, and a daylight-saving change would shift every lease and backoff by an hour.</p></div>
+</section>
+
+<!-- Failures -->
+<section id="failures">
+<h2>What happens when</h2>
+<div class="table-wrap">
+<table>
+<tr><th>Event</th><th>Result</th></tr>
+<tr><td><strong>The handler throws</strong></td><td>The row is retried after <code>retry-backoff</code>. The last attempt sets <code>FAILED</code> with the error in <code>LAST_ERROR</code>.</td></tr>
+<tr><td><strong>The handler runs past the lease</strong></td><td>It is interrupted and the attempt fails with <code>handler outlived its lease</code>.</td></tr>
+<tr><td><strong>The handler ignores the interrupt</strong></td><td>Its worker waits for it. Once the lease ends, another worker can run the job again, and the old outcome write updates 0 rows.</td></tr>
+<tr><td><strong>An instance is killed or its machine dies</strong></td><td>Its rows stay <code>CLAIMED</code> until their leases end, then any instance claims them. Each costs one attempt.</td></tr>
+<tr><td><strong>An instance gets SIGTERM</strong></td><td>It stops claiming and gives running handlers 30s. Handlers still running then are interrupted, which counts as a failed attempt. Rows it leaves <code>CLAIMED</code> run again after their lease.</td></tr>
+<tr><td><strong>The database is unreachable</strong></td><td>Each worker logs the error, sleeps <code>poll-interval</code> and tries again. A dead connection fails after 30s instead of hanging.</td></tr>
+<tr><td><strong>The handler succeeded but saving <code>DONE</code> failed</strong></td><td>The row stays <code>CLAIMED</code> and runs again after its lease (at-least-once).</td></tr>
+<tr><td><strong>Two workers reach for the same row</strong></td><td>The second skips the locked row and takes the next available one. It sleeps only if nothing is left.</td></tr>
+<tr><td><strong>A producer enqueues the same <code>OPERATION_ID</code> twice</strong></td><td>The second insert fails with SQLSTATE 23505: the job is already enqueued.</td></tr>
+</table>
+</div>
+<div class="warn"><p><strong>Handlers must bound their downstream calls with timeouts and stop when interrupted.</strong> <code>workers</code> is a hard concurrency limit. If every worker on an instance is stuck, that instance stops claiming and its rows wait for a free worker on another instance. More workers only delay the stall.</p></div>
+</section>
+
+<!-- Config -->
+<section id="config">
+<h2>Configuration</h2>
+<div class="table-wrap">
+<table>
+<tr><th>Property</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>workqueue.workers</code></td><td>16</td><td>Concurrent jobs per instance</td></tr>
+<tr><td><code>workqueue.lease</code></td><td>60s</td><td>How long a claim lasts, and so the handler's timeout</td></tr>
+<tr><td><code>workqueue.max-attempts</code></td><td>5</td><td>Claims per row, including the first, before <code>FAILED</code></td></tr>
+<tr><td><code>workqueue.retry-backoff</code></td><td>30s</td><td>Wait before a failed row can be claimed again (fixed, not exponential)</td></tr>
+<tr><td><code>workqueue.poll-interval</code></td><td>1s</td><td>How long an idle worker sleeps between claims</td></tr>
+</table>
+</div>
+
+<h3>Choosing values</h3>
+<div class="grid">
+<div class="card"><h3>lease</h3><p>Longer than your slowest legitimate job plus the claim. Too short: slow jobs are interrupted until they fail. Too long: a crashed job waits that long to run again.</p></div>
+<div class="card"><h3>max-attempts × retry-backoff</h3><p>A job that always fails reaches <code>FAILED</code> after about <code>(max-attempts − 1) × retry-backoff</code> plus its run time: about 2 minutes with the defaults.</p></div>
+<div class="card"><h3>poll-interval</h3><p>An idle instance sends <code>workers / poll-interval</code> claims per second, 16 by default. A busy worker claims its next job at once.</p></div>
+<div class="card"><h3>workers and the pool</h3><p>A worker holds a connection only for one statement, so Hikari's default pool of 10 is enough for the queue. Add a connection per worker if the handler uses the same pool.</p></div>
+</div>
+
+<h3>Limits</h3>
+<ul>
+<li>Order is roughly oldest <code>AVAILABLE_AT</code> first, not FIFO. Retries move to the back, and there are no priorities.</li>
+<li>One lease for every job. A job that needs more time than the others needs its own queue.</li>
+<li><code>DONE</code> and <code>FAILED</code> rows stay: they record that an <code>OPERATION_ID</code> was enqueued. Deleting one lets that ID be enqueued again.</li>
+</ul>
+</section>
+
+<!-- Evolution -->
+<section id="evolution">
+<h2>Evolution: from engine to one class</h2>
+<p>The first design (spec dated 2026-09-21, now <a href="superpowers/specs/2026-09-21-db-work-queue-design.md">deprecated</a>) kept claims alive by renewing them and ran background loops to clean up. The redesign drops every loop except the worker's, by making the lease the timeout and the next claim the cleanup.</p>
+
+<figure>
+<svg viewBox="0 0 780 280" role="img" aria-label="Before: five loops hit the table: claim batches of 20, lease renewal every 15 seconds, a sweeper every 30 seconds, a supervisor every second and a backlog sampler every 30 seconds, with fencing on CLAIM_TOKEN and OWNER. Now: only the worker loop remains, claiming one row at a time with fencing on ATTEMPTS; the other four loops are gone.">
+<defs><marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+<line class="guide" x1="390" y1="10" x2="390" y2="275"/>
+<text x="10" y="24" class="b">Before: engine + demo</text>
+<text x="410" y="24" class="b">Now: WorkQueue.java</text>
+
+<rect class="db" x="10" y="40" width="120" height="192" rx="8"/>
+<text x="70" y="70" text-anchor="middle" class="b mono">WORK_ITEM</text>
+<text x="70" y="94" text-anchor="middle" class="lbl muted">fenced on</text>
+<text x="70" y="112" text-anchor="middle" class="lbl mono">CLAIM_TOKEN</text>
+<text x="70" y="128" text-anchor="middle" class="lbl mono">+ OWNER</text>
+
+<rect class="box" x="170" y="40" width="200" height="32" rx="6"/>
+<text x="270" y="60" text-anchor="middle" class="lbl">claim 20 → handle → save</text>
+<rect class="box" x="170" y="80" width="200" height="32" rx="6"/>
+<text x="270" y="100" text-anchor="middle" class="lbl">renew leases · every 15s</text>
+<rect class="box" x="170" y="120" width="200" height="32" rx="6"/>
+<text x="270" y="140" text-anchor="middle" class="lbl">sweep expired · every 30s</text>
+<rect class="box" x="170" y="160" width="200" height="32" rx="6"/>
+<text x="270" y="180" text-anchor="middle" class="lbl">supervise hangs · every 1s</text>
+<rect class="box" x="170" y="200" width="200" height="32" rx="6"/>
+<text x="270" y="220" text-anchor="middle" class="lbl">sample backlog · every 30s</text>
+<line class="line" x1="170" y1="56" x2="132" y2="56" marker-end="url(#a4)"/>
+<line class="line" x1="170" y1="96" x2="132" y2="96" marker-end="url(#a4)"/>
+<line class="line" x1="170" y1="136" x2="132" y2="136" marker-end="url(#a4)"/>
+<line class="line" x1="170" y1="176" x2="132" y2="176" marker-end="url(#a4)"/>
+<line class="line" x1="170" y1="216" x2="132" y2="216" marker-end="url(#a4)"/>
+
+<rect class="db" x="410" y="40" width="120" height="192" rx="8"/>
+<text x="470" y="70" text-anchor="middle" class="b mono">WORK_ITEM</text>
+<text x="470" y="94" text-anchor="middle" class="lbl muted">fenced on</text>
+<text x="470" y="112" text-anchor="middle" class="lbl mono">ATTEMPTS</text>
+
+<rect class="claimed" x="570" y="40" width="200" height="32" rx="6"/>
+<text x="670" y="60" text-anchor="middle" class="lbl">claim 1 → handle → save</text>
+<line class="line" x1="570" y1="56" x2="532" y2="56" marker-end="url(#a4)"/>
+<rect class="gone" x="570" y="80" width="200" height="32" rx="6"/>
+<text x="670" y="100" text-anchor="middle" class="lbl muted">no renewal: lease = timeout</text>
+<rect class="gone" x="570" y="120" width="200" height="32" rx="6"/>
+<text x="670" y="140" text-anchor="middle" class="lbl muted">no sweeper: next claim fails it</text>
+<rect class="gone" x="570" y="160" width="200" height="32" rx="6"/>
+<text x="670" y="180" text-anchor="middle" class="lbl muted">no supervisor: join(lease)</text>
+<rect class="gone" x="570" y="200" width="200" height="32" rx="6"/>
+<text x="670" y="220" text-anchor="middle" class="lbl muted">no sampler: query the table</text>
+
+<text x="190" y="262" text-anchor="middle" class="lbl muted">37 files (with demo) · ~3,400 lines · 25+ settings</text>
+<text x="590" y="262" text-anchor="middle" class="lbl muted">2 files · 268 lines · 5 settings</text>
+</svg>
+<figcaption>Same table, same lease-and-fence idea. Each dashed box is a loop that was removed, with what replaced it.</figcaption>
+</figure>
+
+<h3>What the simplification costs</h3>
+<div class="table-wrap">
+<table>
+<tr><th>Before</th><th>Now</th><th>Cost</th></tr>
+<tr><td>Lease renewed every 15s while the task runs</td><td>Lease fixed at claim time; it is the handler's timeout</td><td>No job can run longer than the lease</td></tr>
+<tr><td>Fence on <code>CLAIM_TOKEN</code> + <code>OWNER</code></td><td>Fence on <code>ATTEMPTS</code></td><td>No revoking one instance's claims</td></tr>
+<tr><td>Sweeper fails expired rows with no attempts left</td><td>The next claim fails them</td><td>They are failed only when a worker is free to claim</td></tr>
+<tr><td>Claim batches of 20, permits</td><td>One row per claim, fixed worker threads</td><td>An idle instance sends <code>workers / poll-interval</code> claims per second</td></tr>
+<tr><td>Supervisor, hung-task limit, liveness probe</td><td>Join the handler with the lease as timeout, then interrupt</td><td>A handler that ignores interrupts pins its worker; nothing restarts the instance</td></tr>
+<tr><td>Metrics, health, admin API, Flyway</td><td>SQL queries, <code>schema.sql</code></td><td>Monitoring and migrations are yours to wire up</td></tr>
+</table>
+</div>
+<p>Both designs rejected bucket ownership with a membership table (rebalancing, skew) and Spring Batch remote partitioning (partitions fixed at step start).</p>
+</section>
+
+<!-- Operate -->
+<section id="operate">
+<h2>Run and check</h2>
+<ol>
+<li>Apply <code>schema.sql</code> to a Db2 that runs in UTC.</li>
+<li>Put your job in the handler in <code>App.java</code>. Throw to retry.</li>
+<li>Set <code>SPRING_DATASOURCE_URL</code>, <code>SPRING_DATASOURCE_USERNAME</code> and <code>SPRING_DATASOURCE_PASSWORD</code>.</li>
+<li>Run <code>./mvnw spring-boot:run</code> on as many machines as you like. SIGTERM lets running jobs finish (up to 30s).</li>
+</ol>
+
+<div class="note"><p><strong>Producers enqueue with</strong> <code>INSERT INTO WORK_ITEM (OPERATION_ID, PAYLOAD) VALUES (?, ?)</code>. A duplicate <code>OPERATION_ID</code> fails with SQLSTATE 23505: already enqueued.</p></div>
+
+<h3>Check what's in the queue</h3>
+<pre><code>-- How many rows in each state
+SELECT STATUS, COUNT(*) FROM WORK_ITEM GROUP BY STATUS;
+
+-- Jobs that ran out of attempts, and why
+SELECT OPERATION_ID, ATTEMPTS, LAST_ERROR FROM WORK_ITEM WHERE STATUS = 'FAILED';
+
+-- How far behind the queue is: the oldest row that could be claimed right now
+SELECT MIN(AVAILABLE_AT) FROM WORK_ITEM WHERE AVAILABLE_AT &lt;= CURRENT TIMESTAMP;
+
+-- Leases that ran out (crashed or hung workers), waiting for another worker
+SELECT * FROM WORK_ITEM WHERE STATUS = 'CLAIMED' AND AVAILABLE_AT &lt; CURRENT TIMESTAMP;</code></pre>
+
+<h3>What the tests prove</h3>
+<p><code>./mvnw test</code> runs against a real Db2 in Docker (a few minutes on Apple Silicon), because the claim relies on <code>SKIP LOCKED DATA</code>.</p>
+<ul>
+<li>Three instances share 300 jobs and run each exactly once.</li>
+<li>A failing job is retried after the backoff, then <code>FAILED</code> with its error.</li>
+<li>A handler that outlives its lease is interrupted, and its worker goes on to the next job.</li>
+<li>An expired lease is claimed again, and the old worker's late outcome is fenced off.</li>
+<li>An expired last attempt is <code>FAILED</code> without running the handler again.</li>
+<li>A handler is not started when claiming used up the lease, or when the queue stopped meanwhile.</li>
+<li>Starting twice, or stopping and starting again, never runs more than <code>workers</code> jobs at once.</li>
+</ul>
+</section>
+
+</main>
+<footer>
+<p>Source: <a href="../db-work-queue/README.md">README</a> · <a href="../db-work-queue/src/main/java/hle/org/workqueue/WorkQueue.java">WorkQueue.java</a> · <a href="../db-work-queue/src/main/resources/schema.sql">schema.sql</a></p>
+</footer>
+</body>
+</html>
