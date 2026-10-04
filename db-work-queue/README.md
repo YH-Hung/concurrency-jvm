@@ -15,13 +15,18 @@ Each instance runs `workers` virtual threads. Each thread loops: **claim → han
 | Claim | Lease the oldest row with `AVAILABLE_AT <= now`: `STATUS='CLAIMED'`, `ATTEMPTS+1`, `AVAILABLE_AT = now + lease` | One statement with `SKIP LOCKED DATA`, so two workers never take the same row |
 | Success | `DONE`, `AVAILABLE_AT = NULL` | Fenced: `WHERE ID = ? AND ATTEMPTS = <this claim's value> AND STATUS = 'CLAIMED'` |
 | Failure | `PENDING` again after `retry-backoff`. `FAILED` at `max-attempts` | Fenced the same way |
-| Crash or hang | Nothing: the lease runs out, so the row can be claimed again | A late write from the old worker updates 0 rows |
+| Crash or hang | Nothing: the lease runs out, so the row can be claimed again. A handler still running at that point is interrupted and the attempt fails | A late write from the old worker updates 0 rows |
 
 `ATTEMPTS` rises with every claim and is never reset, so it also serves as the fencing token. If the last attempt
 crashes, the next claim sets the row to `FAILED` without running the job again.
 
 **Delivery is at-least-once.** A crash after the handler finishes runs the job again, and so does a handler that
 outlives its lease. Make its effects idempotent on `operationId`.
+
+**Handlers must bound their downstream calls with timeouts and stop when interrupted.** `workers` is a hard
+concurrency limit, so a handler that ignores the interrupt keeps its worker until it returns. If every worker on an
+instance is stuck, that instance stops claiming, and its rows wait for a free worker on another instance. More
+workers only delay the stall.
 
 ## Use
 
@@ -37,7 +42,7 @@ fails with SQLSTATE 23505, meaning the job is already enqueued.
 | Property | Default | |
 |---|---|---|
 | `workqueue.workers` | 16 | concurrent jobs per instance |
-| `workqueue.lease` | 60s | must be longer than the handler's worst-case run time |
+| `workqueue.lease` | 60s | how long a claim lasts, and so the handler's timeout |
 | `workqueue.max-attempts` | 5 | |
 | `workqueue.retry-backoff` | 30s | |
 | `workqueue.poll-interval` | 1s | how long an idle worker sleeps between claims |
