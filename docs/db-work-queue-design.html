@@ -12,7 +12,7 @@
   --success:#16a34a; --success-soft:#dcfce7;
   --danger:#dc2626; --danger-soft:#fee2e2;
   --warning:#b45309; --warning-soft:#fef3c7;
-  --code-bg:#0f172a; --code-text:#e2e8f0;
+  --code-bg:#0f172a; --code-text:#e2e8f0; --code-comment:#94a3b8;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -22,7 +22,7 @@
     --success:#4ade80; --success-soft:#14361f;
     --danger:#f87171; --danger-soft:#3f1a1a;
     --warning:#fbbf24; --warning-soft:#3b2f12;
-    --code-bg:#020617; --code-text:#e2e8f0;
+    --code-bg:#020617; --code-text:#e2e8f0; --code-comment:#94a3b8;
   }
 }
 :root[data-theme="dark"] {
@@ -32,7 +32,7 @@
   --success:#4ade80; --success-soft:#14361f;
   --danger:#f87171; --danger-soft:#3f1a1a;
   --warning:#fbbf24; --warning-soft:#3b2f12;
-  --code-bg:#020617; --code-text:#e2e8f0;
+  --code-bg:#020617; --code-text:#e2e8f0; --code-comment:#94a3b8;
 }
 *{margin:0;padding:0;box-sizing:border-box;}
 body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);line-height:1.6;}
@@ -51,6 +51,7 @@ a{color:var(--primary);}
 code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9em;background:var(--surface-2);padding:1px 5px;border-radius:4px;}
 pre{background:var(--code-bg);color:var(--code-text);padding:20px;border-radius:8px;overflow-x:auto;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85em;line-height:1.5;margin:12px 0;}
 pre code{background:none;padding:0;font-size:1em;color:inherit;}
+pre .c{color:var(--code-comment);}
 ul,ol{margin:12px 0 12px 24px;}
 li{margin:4px 0;}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin:16px 0;}
@@ -96,23 +97,26 @@ footer{text-align:center;color:var(--muted);font-size:.9em;padding:16px;}
 
 <header>
 <h1>DB Work Queue</h1>
-<p class="subtitle">A Db2 table as a work queue: lease a row, run the job, write the outcome fenced on the attempt.<br>Two Java files, three SQL statements, no coordinator.</p>
+<p class="subtitle">Any number of app instances share one Db2 table as a job queue.<br>A worker leases a row, runs the job, and saves the outcome only if it still holds the lease.</p>
 </header>
 
 <nav>
-<a href="#architecture">Architecture</a>
-<a href="#sql">Three statements</a>
+<a href="#overview">Overview</a>
+<a href="#table">The table</a>
+<a href="#loop">Worker loop</a>
+<a href="#sql">SQL</a>
 <a href="#states">Row lifecycle</a>
 <a href="#lease">Lease = timeout</a>
 <a href="#failures">Failures</a>
 <a href="#config">Configuration</a>
-<a href="#evolution">Evolution</a>
+<a href="#tradeoffs">Trade-offs</a>
 <a href="#operate">Run &amp; check</a>
 </nav>
 
-<!-- Architecture -->
-<section id="architecture">
-<h2>Architecture</h2>
+<!-- Overview -->
+<section id="overview">
+<h2>Overview</h2>
+<p>Producers insert jobs as rows into <code>WORK_ITEM</code>. Each app instance runs <code>workers</code> threads (default 16), and each thread loops: <strong>claim</strong> a row, run the <strong>handler</strong> (your job code), <strong>save</strong> the outcome. Instances share nothing but the table: no broker, no coordinator, no cleanup job.</p>
 
 <figure>
 <svg viewBox="0 0 760 375" role="img" aria-label="Producers insert rows into the WORK_ITEM table. Three instances with 16, 8 and 32 workers each claim rows with SKIP LOCKED DATA and write outcomes fenced on ATTEMPTS. Instances never talk to each other.">
@@ -158,62 +162,124 @@ footer{text-align:center;color:var(--muted);font-size:.9em;padding:16px;}
 <figcaption>Every instance runs the same loop against the same table. Adding or removing an instance needs no registration or rebalancing.</figcaption>
 </figure>
 
-<h3>Key design decisions</h3>
-<div class="grid">
-<div class="card"><h3>No coordinator</h3><p>No broker, no membership, no sweeper. <code>SKIP LOCKED DATA</code> lets competing workers pass over each other's rows instead of waiting.</p></div>
-<div class="card"><h3>A lease, not a held lock</h3><p>The claim commits at once. No lock or connection is held while the handler runs; ownership ends when <code>AVAILABLE_AT</code> passes.</p></div>
-<div class="card"><h3>Fenced outcomes</h3><p><code>ATTEMPTS</code> rises with every claim and is never reset. Outcome writes require this claim's value, so a stale worker's write updates 0 rows (and is logged).</p></div>
-<div class="card"><h3>At-least-once</h3><p>A crash after the handler, or a handler that outlives its lease, runs the job again. Handlers must be idempotent on <code>operationId</code>.</p></div>
-<div class="card"><h3>Virtual threads</h3><p>One virtual thread per worker and one per running handler, so blocking JDBC and downstream calls cost no platform thread. <code>workers</code> still caps concurrency.</p></div>
+<h3>Five ideas</h3>
+<div class="table-wrap">
+<table>
+<tr><th>Idea</th><th>What it means</th></tr>
+<tr><td><strong>Claim</strong></td><td>One statement marks the oldest claimable row <code>CLAIMED</code> and commits at once. Two workers can't claim the same row.</td></tr>
+<tr><td><strong>Lease</strong></td><td>A claim lasts <code>lease</code> (default 60s); its end time is stored in <code>AVAILABLE_AT</code>. No lock or connection is held while the job runs.</td></tr>
+<tr><td><strong>Expiry is recovery</strong></td><td>Once a lease ends, the row is claimable again, so a crashed worker's job reruns without any sweeper. The lease is also the handler's timeout.</td></tr>
+<tr><td><strong>Fencing</strong></td><td>Each claim adds 1 to <code>ATTEMPTS</code>. A save applies only if <code>ATTEMPTS</code> still equals the value from the worker's own claim, so after a re-claim it changes nothing.</td></tr>
+<tr><td><strong>At-least-once</strong></td><td>A job can run twice, for example when a worker crashes after the handler but before the save. Handlers must be idempotent on <code>OPERATION_ID</code>.</td></tr>
+</table>
 </div>
+</section>
+
+<!-- Table -->
+<section id="table">
+<h2>The table</h2>
+<p>One table, defined in <a href="../db-work-queue/src/main/resources/schema.sql"><code>schema.sql</code></a> and indexed on <code>AVAILABLE_AT</code>.</p>
+<div class="table-wrap">
+<table>
+<tr><th>Column</th><th>Type</th><th>Purpose</th></tr>
+<tr><td><code>ID</code></td><td><code>BIGINT</code> identity, primary key</td><td>Row identity; every outcome write targets it.</td></tr>
+<tr><td><code>OPERATION_ID</code></td><td><code>VARCHAR(64) NOT NULL UNIQUE</code></td><td>Business key, passed to the handler for idempotency. A duplicate insert fails with SQLSTATE 23505.</td></tr>
+<tr><td><code>PAYLOAD</code></td><td><code>VARCHAR(1000) NOT NULL</code></td><td>Job input, passed to the handler.</td></tr>
+<tr><td><code>STATUS</code></td><td><code>PENDING</code>, <code>CLAIMED</code>, <code>DONE</code> or <code>FAILED</code></td><td><a href="#states">Lifecycle</a> state. Outcome writes check it; the claim ignores it.</td></tr>
+<tr><td><code>AVAILABLE_AT</code></td><td><code>TIMESTAMP</code>, default now; <code>NULL</code> only when <code>DONE</code> or <code>FAILED</code></td><td>When the row may next be claimed, on Db2's clock. <code>NULL</code>: never.</td></tr>
+<tr><td><code>ATTEMPTS</code></td><td><code>INTEGER NOT NULL DEFAULT 0</code></td><td>Claims so far, never reset. The fencing token.</td></tr>
+<tr><td><code>LAST_ERROR</code></td><td><code>VARCHAR(1000)</code></td><td>Latest failure, at most 300 characters. Cleared on <code>DONE</code>.</td></tr>
+</table>
+</div>
+
+<h3><code>AVAILABLE_AT</code> decides what can be claimed</h3>
+<p>The claim's only filter is <code>AVAILABLE_AT &lt;= CURRENT TIMESTAMP</code>, oldest first. Each write sets it to the next moment the row may be claimed:</p>
+<div class="table-wrap">
+<table>
+<tr><th>Write</th><th><code>STATUS</code></th><th><code>AVAILABLE_AT</code></th><th>So that</th></tr>
+<tr><td><code>INSERT</code></td><td><code>PENDING</code></td><td>now, or a later time the producer gives</td><td>the job runs at once, or from that time</td></tr>
+<tr><td>CLAIM</td><td><code>CLAIMED</code></td><td>now + <code>lease</code></td><td>no one else takes it until the lease ends</td></tr>
+<tr><td>RETRY</td><td><code>PENDING</code></td><td>now + <code>retry-backoff</code></td><td>a failed job waits before its next try</td></tr>
+<tr><td>FINISH</td><td><code>DONE</code> or <code>FAILED</code></td><td><code>NULL</code></td><td>it is never claimed again (<code>NULL &lt;= now</code> is not true)</td></tr>
+</table>
+</div>
+<div class="note"><p><strong>Nothing happens when a lease ends.</strong> The row still says <code>CLAIMED</code>, but its <code>AVAILABLE_AT</code> is now in the past, so the next claim by any worker takes it. One indexed condition covers new jobs, retries and crash recovery.</p></div>
+</section>
+
+<!-- Worker loop -->
+<section id="loop">
+<h2>The worker loop</h2>
+<p>Everything a worker does (<code>work()</code> and <code>processNext()</code> in <a href="../db-work-queue/src/main/java/hle/org/workqueue/WorkQueue.java"><code>WorkQueue.java</code></a>):</p>
+<pre><code>while running:
+    try:
+        claimed = processNext()
+    catch database error:                    <span class="c">// e.g. Db2 unreachable</span>
+        log it; claimed = false
+    if not claimed: sleep(poll-interval)
+
+processNext():
+    deadline = now + lease                   <span class="c">// worker's own clock, started BEFORE the claim is sent</span>
+    job = CLAIM                              <span class="c">// leases at most one row and commits at once</span>
+    if no job: return false                  <span class="c">// nothing claimable right now</span>
+
+    if job.attempts &gt; max-attempts:          <span class="c">// the last attempt's lease ran out without an outcome</span>
+        FINISH(job, FAILED, "lease expired on the last attempt"); return true
+    if not running: return true              <span class="c">// shutting down: row stays CLAIMED until its lease ends</span>
+    if now &gt;= deadline: return true          <span class="c">// claiming used the whole lease: same</span>
+
+    start handler(operationId, payload) on a new virtual thread
+    wait for it, at most until deadline
+    if it is still running:
+        interrupt it, then wait for it to stop (no time limit)
+        result = failure "handler outlived its lease"
+
+    if handler returned:                     FINISH(job, DONE)
+    else if job.attempts &lt; max-attempts:     RETRY(job, error)    <span class="c">// PENDING, claimable after retry-backoff</span>
+    else:                                    FINISH(job, FAILED, error)
+    return true                              <span class="c">// claim the next job without sleeping</span></code></pre>
+<ul>
+<li><strong>Failure</strong>: the handler threw anything (<code>Error</code>s included) or timed out. <code>error</code> is the exception's <code>toString()</code>, cut to 300 characters.</li>
+<li><strong>A save that updates 0 rows</strong> lost to a newer claim (see <a href="#fence">the fence</a>). The worker logs it and moves on.</li>
+<li><strong><code>workers</code> is a hard cap.</strong> A worker runs one handler at a time and waits for it even after interrupting it.</li>
+<li><strong>Virtual threads</strong> run workers and handlers, so blocking calls don't tie up OS threads. They don't keep the JVM alive, hence <code>spring.main.keep-alive=true</code>.</li>
+</ul>
+
+<h3>Starting and stopping</h3>
+<p><code>WorkQueue</code> is a Spring <code>SmartLifecycle</code> bean. <code>start()</code> launches the workers at startup. It does nothing if already running, and throws if handlers from a previous run are still alive, so a restart never exceeds <code>workers</code>. <code>stop()</code> runs at shutdown (for example on SIGTERM): it sets <code>running = false</code>, waits up to 30s for handlers, then interrupts the remaining workers and returns. Each interrupted worker interrupts its handler and tries to save a failed attempt. Rows left <code>CLAIMED</code> rerun after their lease.</p>
 </section>
 
 <!-- SQL -->
 <section id="sql">
-<h2>The core: three SQL statements</h2>
-<p>This is all the SQL in <a href="../db-work-queue/src/main/java/hle/org/workqueue/WorkQueue.java"><code>WorkQueue.java</code></a>. Recovery from crashes needs no statement of its own.</p>
+<h2>The three SQL statements</h2>
+<p>This is all the SQL in <code>WorkQueue.java</code>. Each statement auto-commits on its own.</p>
 
-<h3>1. CLAIM: lease the oldest available row</h3>
+<h3>CLAIM: lease the oldest claimable row</h3>
 <pre><code>SELECT ID, OPERATION_ID, PAYLOAD, ATTEMPTS FROM FINAL TABLE (
   UPDATE (SELECT ID, OPERATION_ID, PAYLOAD, STATUS, ATTEMPTS, AVAILABLE_AT FROM WORK_ITEM
            WHERE AVAILABLE_AT &lt;= CURRENT TIMESTAMP ORDER BY AVAILABLE_AT FETCH FIRST 1 ROW ONLY)
      SET STATUS = 'CLAIMED', ATTEMPTS = ATTEMPTS + 1,
          AVAILABLE_AT = CURRENT TIMESTAMP + CAST(:lease AS DECIMAL(18, 3)) SECONDS)
 SKIP LOCKED DATA</code></pre>
-<p><strong>Why it's safe:</strong> select, update and read-back are one statement, and rows another claimer has locked are skipped, so two workers never take the same row. <code>AVAILABLE_AT &lt;= now</code> matches new rows, retries whose backoff is over, and <code>CLAIMED</code> rows whose lease ran out, which is how crashed work comes back. The returned <code>ATTEMPTS</code> is this claim's fencing token.</p>
+<p>The inner <code>SELECT</code> picks the oldest row whose <code>AVAILABLE_AT</code> has passed. The <code>UPDATE</code> marks it <code>CLAIMED</code>, adds 1 to <code>ATTEMPTS</code> and sets the lease end. <code>FINAL TABLE</code> returns the updated row, so the worker gets its fencing token (the new <code>ATTEMPTS</code>) from the same statement.</p>
+<p><strong>Why two workers can't take the same row:</strong> the <code>UPDATE</code> locks the row it changes, and <code>SKIP LOCKED DATA</code> makes a competing claim skip that row instead of waiting for it. The claim commits at once; from then on the row's future <code>AVAILABLE_AT</code> keeps it out of every claim until the lease ends. No <code>SELECT … FOR UPDATE</code> is needed, because there is no separate read step to protect.</p>
+<div class="note"><p><strong>Requires</strong> auto-commit (the default), so the claim commits before the handler starts, and isolation Cursor Stability (the Db2 JDBC default) or Read Stability. Db2 ignores <code>SKIP LOCKED DATA</code> under Uncommitted Read and Repeatable Read (IBM's <a href="https://www.ibm.com/docs/en/db2/12.1.x?topic=statements-update">UPDATE reference</a>).</p></div>
 
-<h3>2. RETRY: the handler failed and attempts are left</h3>
+<h3>RETRY: failed, attempts left</h3>
 <pre><code>UPDATE WORK_ITEM
    SET STATUS = 'PENDING', LAST_ERROR = :error,
        AVAILABLE_AT = CURRENT TIMESTAMP + CAST(:backoff AS DECIMAL(18, 3)) SECONDS
  WHERE ID = :id AND ATTEMPTS = :attempts AND STATUS = 'CLAIMED'</code></pre>
+<p>Back to <code>PENDING</code>, claimable after <code>retry-backoff</code>.</p>
 
-<h3>3. FINISH: DONE, or FAILED on the last attempt</h3>
+<h3>FINISH: DONE, or FAILED when attempts are used up</h3>
 <pre><code>UPDATE WORK_ITEM
    SET STATUS = :status, LAST_ERROR = :error, AVAILABLE_AT = NULL
  WHERE ID = :id AND ATTEMPTS = :attempts AND STATUS = 'CLAIMED'</code></pre>
-<p><strong>Why it's safe:</strong> if the lease ran out and another worker claimed the row, <code>ATTEMPTS</code> has moved on and the write updates 0 rows. The worker logs that it lost its lease and moves to the next job.</p>
+<p>Final status. <code>AVAILABLE_AT = NULL</code> takes the row out of the queue for good. <code>:error</code> is <code>NULL</code> for <code>DONE</code>.</p>
 
-<h3>Schema</h3>
-<div class="table-wrap">
-<table>
-<tr><th>Column</th><th>Type and constraints</th><th>Role</th></tr>
-<tr><td><code>ID</code></td><td><code>BIGINT</code> identity, primary key</td><td>Row identity, part of every fenced write</td></tr>
-<tr><td><code>OPERATION_ID</code></td><td><code>VARCHAR(64) NOT NULL UNIQUE</code></td><td>Idempotency key. A duplicate insert fails with SQLSTATE 23505</td></tr>
-<tr><td><code>PAYLOAD</code></td><td><code>VARCHAR(1000) NOT NULL</code></td><td>Passed to the handler</td></tr>
-<tr><td><code>STATUS</code></td><td><code>VARCHAR(7)</code>, one of <code>PENDING</code>, <code>CLAIMED</code>, <code>DONE</code>, <code>FAILED</code></td><td>Current state</td></tr>
-<tr><td><code>AVAILABLE_AT</code></td><td><code>TIMESTAMP</code>, default now, indexed. <code>NULL</code> only when <code>DONE</code> or <code>FAILED</code></td><td>Claimable from. While <code>CLAIMED</code>, the lease end</td></tr>
-<tr><td><code>ATTEMPTS</code></td><td><code>INTEGER NOT NULL DEFAULT 0</code></td><td>+1 per claim, never reset: the fencing token</td></tr>
-<tr><td><code>LAST_ERROR</code></td><td><code>VARCHAR(1000)</code></td><td>Latest failure, cut to 300 characters</td></tr>
-</table>
-</div>
-
-<h3>Invariants</h3>
-<ul>
-<li><strong><code>ATTEMPTS</code> only goes up.</strong> Each claim gets a value no other claim of that row ever had.</li>
-<li><strong><code>AVAILABLE_AT</code> is <code>NULL</code> exactly when the row is finished.</strong> A <code>CHECK</code> enforces it, and finished rows never match the claim.</li>
-<li><strong>The lease is the handler's timeout.</strong> A handler still running when it ends is interrupted and the attempt fails.</li>
-</ul>
+<h3 id="fence">The fence</h3>
+<p>Both outcome writes require <code>ATTEMPTS = :attempts</code>, the value this worker's claim returned, and <code>STATUS = 'CLAIMED'</code>. If the lease ran out and another worker re-claimed the row, <code>ATTEMPTS</code> has grown, the write matches 0 rows, and the stale outcome is dropped.</p>
+<p>The fence protects the row, not the outside world: the stale handler's downstream effects have already happened. Hence idempotent handlers.</p>
 </section>
 
 <!-- States -->
@@ -257,39 +323,40 @@ SKIP LOCKED DATA</code></pre>
 
 <div class="table-wrap">
 <table>
-<tr><th>From</th><th>Trigger</th><th>To</th><th>Statement</th></tr>
+<tr><th>From</th><th>Event</th><th>To</th><th>Statement</th></tr>
 <tr><td>none</td><td>Producer inserts</td><td><code>PENDING</code></td><td><code>INSERT</code></td></tr>
-<tr><td><code>PENDING</code>, or <code>CLAIMED</code> with an expired lease</td><td>A worker claims it (<code>AVAILABLE_AT &lt;= now</code>)</td><td><code>CLAIMED</code>, <code>ATTEMPTS + 1</code></td><td>CLAIM</td></tr>
+<tr><td><code>PENDING</code> whose time has come, or <code>CLAIMED</code> whose lease ended</td><td>A worker claims it</td><td><code>CLAIMED</code>, <code>ATTEMPTS + 1</code></td><td>CLAIM</td></tr>
 <tr><td><code>CLAIMED</code></td><td>Handler returns</td><td><code>DONE</code></td><td>FINISH</td></tr>
-<tr><td><code>CLAIMED</code></td><td>Handler throws or times out, <code>ATTEMPTS &lt; max-attempts</code></td><td><code>PENDING</code>, claimable after <code>retry-backoff</code></td><td>RETRY</td></tr>
-<tr><td><code>CLAIMED</code></td><td>Handler throws or times out, <code>ATTEMPTS = max-attempts</code></td><td><code>FAILED</code></td><td>FINISH</td></tr>
-<tr><td><code>CLAIMED</code> with an expired lease</td><td>The claim's new <code>ATTEMPTS</code> exceeds <code>max-attempts</code></td><td><code>FAILED</code>, handler not run</td><td>CLAIM, then FINISH</td></tr>
+<tr><td><code>CLAIMED</code></td><td>Handler fails, <code>ATTEMPTS &lt; max-attempts</code></td><td><code>PENDING</code></td><td>RETRY</td></tr>
+<tr><td><code>CLAIMED</code></td><td>Handler fails, <code>ATTEMPTS = max-attempts</code></td><td><code>FAILED</code></td><td>FINISH</td></tr>
+<tr><td><code>CLAIMED</code> whose lease ended</td><td>Claimed again, and the new <code>ATTEMPTS</code> exceeds <code>max-attempts</code></td><td><code>FAILED</code>, handler not run</td><td>CLAIM, then FINISH</td></tr>
 </table>
 </div>
 
-<h3>One row's life</h3>
-<p><code>max-attempts=3</code>, <code>lease=60s</code>, <code>retry-backoff=30s</code>:</p>
+<h3>Example: one row's life</h3>
+<p>With <code>max-attempts=3</code>, <code>lease=60s</code>, <code>retry-backoff=30s</code>:</p>
 <div class="table-wrap">
 <table>
-<tr><th>Time</th><th>Event</th><th>STATUS</th><th>ATTEMPTS</th><th>AVAILABLE_AT</th></tr>
+<tr><th>Time</th><th>Event</th><th><code>STATUS</code></th><th><code>ATTEMPTS</code></th><th><code>AVAILABLE_AT</code></th></tr>
 <tr><td>10:00:00</td><td>Producer inserts</td><td><code>PENDING</code></td><td>0</td><td>10:00:00</td></tr>
 <tr><td>10:00:01</td><td>Worker A claims</td><td><code>CLAIMED</code></td><td>1</td><td>10:01:01</td></tr>
-<tr><td>10:00:04</td><td>A's handler throws</td><td><code>PENDING</code></td><td>1</td><td>10:00:34</td></tr>
+<tr><td>10:00:04</td><td>A's handler throws; A saves RETRY</td><td><code>PENDING</code></td><td>1</td><td>10:00:34</td></tr>
 <tr><td>10:00:34</td><td>Worker B claims</td><td><code>CLAIMED</code></td><td>2</td><td>10:01:34</td></tr>
-<tr><td>10:00:40</td><td>B's machine freezes</td><td><code>CLAIMED</code></td><td>2</td><td>10:01:34</td></tr>
-<tr><td>10:01:34</td><td>Worker C claims the expired lease</td><td><code>CLAIMED</code></td><td>3</td><td>10:02:34</td></tr>
-<tr><td>10:01:37</td><td>C's handler returns</td><td><code>DONE</code></td><td>3</td><td><code>NULL</code></td></tr>
+<tr><td>10:00:40</td><td>B's machine freezes; the row doesn't change</td><td><code>CLAIMED</code></td><td>2</td><td>10:01:34</td></tr>
+<tr><td>10:01:34</td><td>B's lease has ended; worker C claims</td><td><code>CLAIMED</code></td><td>3</td><td>10:02:34</td></tr>
+<tr><td>10:01:37</td><td>C's handler returns; C saves DONE</td><td><code>DONE</code></td><td>3</td><td><code>NULL</code></td></tr>
 </table>
 </div>
-<div class="note"><p><strong>The fence at work:</strong> if B wakes up afterwards and writes its outcome, the write requires <code>ATTEMPTS = 2</code> and so changes nothing. If C had crashed too, the next claim would set <code>ATTEMPTS = 4</code>, see it is past <code>max-attempts</code>, and write <code>FAILED</code>.</p></div>
+<div class="note"><p><strong>The fence at work:</strong> if B wakes up later and saves, its write requires <code>ATTEMPTS = 2</code>. The row has 3, so nothing changes.</p><p><strong>Out of attempts:</strong> had C crashed too, the first claim after 10:02:34 would set <code>ATTEMPTS = 4</code>, see that 4 exceeds 3, and save <code>FAILED</code> without running the handler. Rows failed this way show <code>ATTEMPTS = max-attempts + 1</code>.</p></div>
 </section>
 
 <!-- Lease -->
 <section id="lease">
 <h2>The lease is also the handler's timeout</h2>
+<p>A lease can't be extended, so the worker must stop the handler before the lease ends. It starts its countdown just before sending the claim; Db2 starts the lease when it runs the claim, slightly later. The worker's deadline therefore always comes first, and the handler gets <code>lease</code> minus the claim's round trip.</p>
 
 <figure>
-<svg viewBox="0 0 780 200" role="img" aria-label="Timeline. The worker starts its countdown at t0, before sending the claim. Db2 runs the claim at t1 and holds the lease until t1 plus lease. The worker interrupts the handler at t0 plus lease, which is earlier, so its FINISH or RETRY write lands while the row is still held. After t1 plus lease the row is claimable again.">
+<svg viewBox="0 0 780 200" role="img" aria-label="Timeline. The worker starts its countdown at t0, before sending the claim. Db2 runs the claim at t1 and holds the lease until t1 plus lease. The worker interrupts the handler at t0 plus lease, which is earlier, so its FINISH or RETRY write normally lands while the row is still held. After t1 plus lease the row is claimable again.">
 <defs><marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
 <text x="10" y="75" class="b">worker</text>
 <text x="10" y="91" class="lbl muted">JVM clock</text>
@@ -322,15 +389,15 @@ SKIP LOCKED DATA</code></pre>
 <text x="174" y="187" class="lbl">t₁: AVAILABLE_AT = t₁ + lease</text>
 <text x="614" y="187" class="lbl">t₁ + lease: lease ends</text>
 </svg>
-<figcaption>The worker's countdown starts before the claim is sent, so it always ends before Db2's lease does. The gap between the two is the claim's round trip.</figcaption>
+<figcaption>The gap between the worker's deadline (t₀ + lease) and the end of Db2's lease (t₁ + lease) is the claim's round trip.</figcaption>
 </figure>
 
 <ul>
-<li>A handler that stops when interrupted gets its outcome written while the row is still its own.</li>
-<li>A handler that ignores the interrupt keeps its worker busy. Once Db2's lease ends, another worker can run the job again, and the old outcome write updates 0 rows.</li>
-<li>If claiming itself took the whole lease, the handler is not started. The row waits out its lease as if the worker had crashed.</li>
+<li><strong>Handler stops when interrupted:</strong> its failed attempt is saved, normally within the lease. A later save still succeeds unless another worker has re-claimed the row.</li>
+<li><strong>Handler ignores the interrupt:</strong> its worker keeps waiting. After Db2's lease ends, another worker may run the same job concurrently; the old worker's save then updates 0 rows.</li>
+<li><strong>Claiming took the whole lease</strong> (slow connection pool or network): the handler isn't started. The row waits out its lease as after a crash, and that attempt is used up.</li>
 </ul>
-<div class="warn"><p><strong>Db2 must run in UTC.</strong> Leases and backoffs use only the database clock, so app machines' clocks don't matter. But <code>CURRENT TIMESTAMP</code> is local time, and a daylight-saving change would shift every lease and backoff by an hour.</p></div>
+<div class="warn"><p><strong>Run Db2 in UTC.</strong> Lease and backoff times use only Db2's clock, so app servers' clocks don't matter. But <code>CURRENT TIMESTAMP</code> is Db2's local time: a daylight-saving jump would end in-progress leases and backoffs up to an hour early (jobs run twice) or late.</p></div>
 </section>
 
 <!-- Failures -->
@@ -339,120 +406,68 @@ SKIP LOCKED DATA</code></pre>
 <div class="table-wrap">
 <table>
 <tr><th>Event</th><th>Result</th></tr>
-<tr><td><strong>The handler throws</strong></td><td>The row is retried after <code>retry-backoff</code>. The last attempt sets <code>FAILED</code> with the error in <code>LAST_ERROR</code>.</td></tr>
-<tr><td><strong>The handler runs past the lease</strong></td><td>It is interrupted and the attempt fails with <code>handler outlived its lease</code>.</td></tr>
-<tr><td><strong>The handler ignores the interrupt</strong></td><td>Its worker waits for it. Once the lease ends, another worker can run the job again, and the old outcome write updates 0 rows.</td></tr>
-<tr><td><strong>An instance is killed or its machine dies</strong></td><td>Its rows stay <code>CLAIMED</code> until their leases end, then any instance claims them. Each costs one attempt.</td></tr>
-<tr><td><strong>An instance gets SIGTERM</strong></td><td>It stops claiming and gives running handlers 30s. Handlers still running then are interrupted, which counts as a failed attempt. Rows it leaves <code>CLAIMED</code> run again after their lease.</td></tr>
-<tr><td><strong>The database is unreachable</strong></td><td>Each worker logs the error, sleeps <code>poll-interval</code> and tries again. A dead connection fails after 30s instead of hanging.</td></tr>
-<tr><td><strong>The handler succeeded but saving <code>DONE</code> failed</strong></td><td>The row stays <code>CLAIMED</code> and runs again after its lease (at-least-once).</td></tr>
-<tr><td><strong>Two workers reach for the same row</strong></td><td>The second skips the locked row and takes the next available one. It sleeps only if nothing is left.</td></tr>
-<tr><td><strong>A producer enqueues the same <code>OPERATION_ID</code> twice</strong></td><td>The second insert fails with SQLSTATE 23505: the job is already enqueued.</td></tr>
+<tr><td><strong>The handler throws</strong></td><td>Failed attempt: RETRY after <code>retry-backoff</code>, or <code>FAILED</code> with the error in <code>LAST_ERROR</code> on the last attempt.</td></tr>
+<tr><td><strong>The handler runs past the lease</strong></td><td>Interrupted; failed attempt with <code>handler outlived its lease</code>.</td></tr>
+<tr><td><strong>The handler ignores the interrupt</strong></td><td>Its worker stays busy. After the lease, another worker may rerun the job; the old outcome is fenced off.</td></tr>
+<tr><td><strong>An instance crashes or freezes</strong></td><td>Its rows stay <code>CLAIMED</code> until their leases end, then any worker claims them, using an attempt. If none are left, the row becomes <code>FAILED</code> without running.</td></tr>
+<tr><td><strong>Saving <code>DONE</code> fails after the handler succeeded</strong></td><td>The row stays <code>CLAIMED</code>; the job reruns after the lease.</td></tr>
+<tr><td><strong>An instance gets SIGTERM</strong></td><td>It stops claiming; handlers get 30s, then are interrupted, which counts as failed attempts.</td></tr>
+<tr><td><strong>The database is unreachable</strong></td><td>Workers log, sleep <code>poll-interval</code> and retry. A dead connection errors after 30s (<code>blockingReadConnectionTimeout</code>) instead of hanging.</td></tr>
+<tr><td><strong>Two workers race for one row</strong></td><td>One gets it; the other skips it and takes the next claimable row.</td></tr>
+<tr><td><strong>A producer inserts an <code>OPERATION_ID</code> twice</strong></td><td>The second insert fails with SQLSTATE 23505: already enqueued.</td></tr>
 </table>
 </div>
-<div class="warn"><p><strong>Handlers must bound their downstream calls with timeouts and stop when interrupted.</strong> <code>workers</code> is a hard concurrency limit. If every worker on an instance is stuck, that instance stops claiming and its rows wait for a free worker on another instance. More workers only delay the stall.</p></div>
+<div class="warn"><p><strong>Handlers must time out their downstream calls and stop when interrupted.</strong> The queue can interrupt a handler but not force it to stop. If all of an instance's workers are stuck, it stops processing, and other instances take its rows once their leases end. More workers only delay the stall.</p></div>
 </section>
 
 <!-- Config -->
 <section id="config">
 <h2>Configuration</h2>
+<p>Optional <code>workqueue.*</code> properties. Invalid values fail startup.</p>
 <div class="table-wrap">
 <table>
-<tr><th>Property</th><th>Default</th><th>Meaning</th></tr>
-<tr><td><code>workqueue.workers</code></td><td>16</td><td>Concurrent jobs per instance</td></tr>
-<tr><td><code>workqueue.lease</code></td><td>60s</td><td>How long a claim lasts, and so the handler's timeout</td></tr>
-<tr><td><code>workqueue.max-attempts</code></td><td>5</td><td>Claims per row, including the first, before <code>FAILED</code></td></tr>
-<tr><td><code>workqueue.retry-backoff</code></td><td>30s</td><td>Wait before a failed row can be claimed again (fixed, not exponential)</td></tr>
-<tr><td><code>workqueue.poll-interval</code></td><td>1s</td><td>How long an idle worker sleeps between claims</td></tr>
+<tr><th>Property</th><th>Default</th><th>Valid</th><th>Meaning</th></tr>
+<tr><td><code>workqueue.workers</code></td><td>16</td><td>≥ 1</td><td>Maximum concurrent handlers per instance</td></tr>
+<tr><td><code>workqueue.lease</code></td><td>60s</td><td>≥ 1ms</td><td>How long a claim lasts: the handler's time budget, claim time included</td></tr>
+<tr><td><code>workqueue.max-attempts</code></td><td>5</td><td>≥ 1</td><td>Claims per job, the first included, before <code>FAILED</code>. Crashes and timeouts count</td></tr>
+<tr><td><code>workqueue.retry-backoff</code></td><td>30s</td><td>≥ 0</td><td>Fixed wait after a failed attempt</td></tr>
+<tr><td><code>workqueue.poll-interval</code></td><td>1s</td><td>&gt; 0</td><td>Sleep after an empty claim or a database error</td></tr>
 </table>
 </div>
 
 <h3>Choosing values</h3>
 <div class="grid">
-<div class="card"><h3>lease</h3><p>Longer than your slowest legitimate job plus the claim. Too short: slow jobs are interrupted until they fail. Too long: a crashed job waits that long to run again.</p></div>
-<div class="card"><h3>max-attempts × retry-backoff</h3><p>A job that always fails reaches <code>FAILED</code> after about <code>(max-attempts − 1) × retry-backoff</code> plus its run time: about 2 minutes with the defaults.</p></div>
-<div class="card"><h3>poll-interval</h3><p>An idle instance sends <code>workers / poll-interval</code> claims per second, 16 by default. A busy worker claims its next job at once.</p></div>
-<div class="card"><h3>workers and the pool</h3><p>A worker holds a connection only for one statement, so Hikari's default pool of 10 is enough for the queue. Add a connection per worker if the handler uses the same pool.</p></div>
+<div class="card"><h3>lease</h3><p>Longer than the slowest legitimate job plus the claim. Too short: slow jobs time out on every attempt and end <code>FAILED</code>. Too long: a crashed worker's job waits that long to rerun.</p></div>
+<div class="card"><h3>max-attempts × retry-backoff</h3><p>A job that always fails is <code>FAILED</code> after about <code>(max-attempts − 1) × retry-backoff</code> plus its run times: about 2 minutes by default.</p></div>
+<div class="card"><h3>poll-interval</h3><p>An idle instance sends <code>workers / poll-interval</code> claims per second, 16 by default. Busy workers don't sleep.</p></div>
+<div class="card"><h3>Connection pool</h3><p>A worker holds a connection for one short statement, so Hikari's default pool of 10 is enough for the queue. Add one per worker if handlers share the pool. Waiting for a connection counts against the lease.</p></div>
 </div>
-
-<h3>Limits</h3>
-<ul>
-<li>Order is roughly oldest <code>AVAILABLE_AT</code> first, not FIFO. Retries move to the back, and there are no priorities.</li>
-<li>One lease for every job. A job that needs more time than the others needs its own queue.</li>
-<li><code>DONE</code> and <code>FAILED</code> rows stay: they record that an <code>OPERATION_ID</code> was enqueued. Deleting one lets that ID be enqueued again.</li>
-</ul>
 </section>
 
-<!-- Evolution -->
-<section id="evolution">
-<h2>Evolution: from engine to one class</h2>
-<p>The first design (spec dated 2026-09-21, now <a href="superpowers/specs/2026-09-21-db-work-queue-design.md">deprecated</a>) kept claims alive by renewing them and ran background loops to clean up. The redesign drops every loop except the worker's, by making the lease the timeout and the next claim the cleanup.</p>
-
-<figure>
-<svg viewBox="0 0 780 280" role="img" aria-label="Before: five loops hit the table: claim batches of 20, lease renewal every 15 seconds, a sweeper every 30 seconds, a supervisor every second and a backlog sampler every 30 seconds, with fencing on CLAIM_TOKEN and OWNER. Now: only the worker loop remains, claiming one row at a time with fencing on ATTEMPTS; the other four loops are gone.">
-<defs><marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
-<line class="guide" x1="390" y1="10" x2="390" y2="275"/>
-<text x="10" y="24" class="b">Before: engine + demo</text>
-<text x="410" y="24" class="b">Now: WorkQueue.java</text>
-
-<rect class="db" x="10" y="40" width="120" height="192" rx="8"/>
-<text x="70" y="70" text-anchor="middle" class="b mono">WORK_ITEM</text>
-<text x="70" y="94" text-anchor="middle" class="lbl muted">fenced on</text>
-<text x="70" y="112" text-anchor="middle" class="lbl mono">CLAIM_TOKEN</text>
-<text x="70" y="128" text-anchor="middle" class="lbl mono">+ OWNER</text>
-
-<rect class="box" x="170" y="40" width="200" height="32" rx="6"/>
-<text x="270" y="60" text-anchor="middle" class="lbl">claim 20 → handle → save</text>
-<rect class="box" x="170" y="80" width="200" height="32" rx="6"/>
-<text x="270" y="100" text-anchor="middle" class="lbl">renew leases · every 15s</text>
-<rect class="box" x="170" y="120" width="200" height="32" rx="6"/>
-<text x="270" y="140" text-anchor="middle" class="lbl">sweep expired · every 30s</text>
-<rect class="box" x="170" y="160" width="200" height="32" rx="6"/>
-<text x="270" y="180" text-anchor="middle" class="lbl">supervise hangs · every 1s</text>
-<rect class="box" x="170" y="200" width="200" height="32" rx="6"/>
-<text x="270" y="220" text-anchor="middle" class="lbl">sample backlog · every 30s</text>
-<line class="line" x1="170" y1="56" x2="132" y2="56" marker-end="url(#a4)"/>
-<line class="line" x1="170" y1="96" x2="132" y2="96" marker-end="url(#a4)"/>
-<line class="line" x1="170" y1="136" x2="132" y2="136" marker-end="url(#a4)"/>
-<line class="line" x1="170" y1="176" x2="132" y2="176" marker-end="url(#a4)"/>
-<line class="line" x1="170" y1="216" x2="132" y2="216" marker-end="url(#a4)"/>
-
-<rect class="db" x="410" y="40" width="120" height="192" rx="8"/>
-<text x="470" y="70" text-anchor="middle" class="b mono">WORK_ITEM</text>
-<text x="470" y="94" text-anchor="middle" class="lbl muted">fenced on</text>
-<text x="470" y="112" text-anchor="middle" class="lbl mono">ATTEMPTS</text>
-
-<rect class="claimed" x="570" y="40" width="200" height="32" rx="6"/>
-<text x="670" y="60" text-anchor="middle" class="lbl">claim 1 → handle → save</text>
-<line class="line" x1="570" y1="56" x2="532" y2="56" marker-end="url(#a4)"/>
-<rect class="gone" x="570" y="80" width="200" height="32" rx="6"/>
-<text x="670" y="100" text-anchor="middle" class="lbl muted">no renewal: lease = timeout</text>
-<rect class="gone" x="570" y="120" width="200" height="32" rx="6"/>
-<text x="670" y="140" text-anchor="middle" class="lbl muted">no sweeper: next claim fails it</text>
-<rect class="gone" x="570" y="160" width="200" height="32" rx="6"/>
-<text x="670" y="180" text-anchor="middle" class="lbl muted">no supervisor: join(lease)</text>
-<rect class="gone" x="570" y="200" width="200" height="32" rx="6"/>
-<text x="670" y="220" text-anchor="middle" class="lbl muted">no sampler: query the table</text>
-
-<text x="190" y="262" text-anchor="middle" class="lbl muted">37 files (with demo) · ~3,400 lines · 25+ settings</text>
-<text x="590" y="262" text-anchor="middle" class="lbl muted">2 files · 268 lines · 5 settings</text>
-</svg>
-<figcaption>Same table, same lease-and-fence idea. Each dashed box is a loop that was removed, with what replaced it.</figcaption>
-</figure>
-
-<h3>What the simplification costs</h3>
+<!-- Trade-offs -->
+<section id="tradeoffs">
+<h2>Trade-offs and limits</h2>
+<p>This design replaces an earlier engine (<a href="superpowers/specs/2026-09-21-db-work-queue-design.md">deprecated spec</a>) that renewed leases and ran four background loops besides the workers. Removing them costs:</p>
 <div class="table-wrap">
 <table>
 <tr><th>Before</th><th>Now</th><th>Cost</th></tr>
-<tr><td>Lease renewed every 15s while the task runs</td><td>Lease fixed at claim time; it is the handler's timeout</td><td>No job can run longer than the lease</td></tr>
-<tr><td>Fence on <code>CLAIM_TOKEN</code> + <code>OWNER</code></td><td>Fence on <code>ATTEMPTS</code></td><td>No revoking one instance's claims</td></tr>
-<tr><td>Sweeper fails expired rows with no attempts left</td><td>The next claim fails them</td><td>They are failed only when a worker is free to claim</td></tr>
-<tr><td>Claim batches of 20, permits</td><td>One row per claim, fixed worker threads</td><td>An idle instance sends <code>workers / poll-interval</code> claims per second</td></tr>
-<tr><td>Supervisor, hung-task limit, liveness probe</td><td>Join the handler with the lease as timeout, then interrupt</td><td>A handler that ignores interrupts pins its worker; nothing restarts the instance</td></tr>
+<tr><td>Lease renewed every 15s while the job runs</td><td>Fixed lease, also the handler's timeout</td><td>No job can run longer than the lease</td></tr>
+<tr><td>Fence on <code>CLAIM_TOKEN</code> + <code>OWNER</code></td><td>Fence on <code>ATTEMPTS</code></td><td>No way to revoke one instance's claims</td></tr>
+<tr><td>Sweeper fails expired rows with no attempts left</td><td>The next claim fails them</td><td>Only when a worker is free to claim them</td></tr>
+<tr><td>Claims in batches of 20</td><td>One row per claim</td><td>An idle instance sends <code>workers / poll-interval</code> claims per second</td></tr>
+<tr><td>Supervisor, hung-task limit, liveness probe</td><td>Wait on the handler until the deadline, then interrupt</td><td>A handler that ignores interrupts pins its worker; nothing restarts the instance</td></tr>
 <tr><td>Metrics, health, admin API, Flyway</td><td>SQL queries, <code>schema.sql</code></td><td>Monitoring and migrations are yours to wire up</td></tr>
 </table>
 </div>
 <p>Both designs rejected bucket ownership with a membership table (rebalancing, skew) and Spring Batch remote partitioning (partitions fixed at step start).</p>
+
+<h3>Limits</h3>
+<ul>
+<li>Roughly oldest <code>AVAILABLE_AT</code> first, not FIFO. Retries go to the back; there are no priorities.</li>
+<li>One lease for every job. Jobs that need a much longer lease need a separate queue.</li>
+<li><code>OPERATION_ID</code> holds 64 bytes; <code>PAYLOAD</code> and <code>LAST_ERROR</code> hold 1000 bytes.</li>
+<li><code>DONE</code> and <code>FAILED</code> rows stay, recording that an <code>OPERATION_ID</code> was enqueued. Deleting one lets that ID be enqueued again.</li>
+</ul>
 </section>
 
 <!-- Operate -->
@@ -460,12 +475,11 @@ SKIP LOCKED DATA</code></pre>
 <h2>Run and check</h2>
 <ol>
 <li>Apply <code>schema.sql</code> to a Db2 that runs in UTC.</li>
-<li>Put your job in the handler in <code>App.java</code>. Throw to retry.</li>
+<li>Put your job in the handler lambda in <code>App.java</code>. Return for <code>DONE</code>; throw to retry.</li>
 <li>Set <code>SPRING_DATASOURCE_URL</code>, <code>SPRING_DATASOURCE_USERNAME</code> and <code>SPRING_DATASOURCE_PASSWORD</code>.</li>
-<li>Run <code>./mvnw spring-boot:run</code> on as many machines as you like. SIGTERM lets running jobs finish (up to 30s).</li>
+<li>From <code>db-work-queue</code>, run <code>./mvnw spring-boot:run</code> (Java 25) on as many machines as you like.</li>
 </ol>
-
-<div class="note"><p><strong>Producers enqueue with</strong> <code>INSERT INTO WORK_ITEM (OPERATION_ID, PAYLOAD) VALUES (?, ?)</code>. A duplicate <code>OPERATION_ID</code> fails with SQLSTATE 23505: already enqueued.</p></div>
+<div class="note"><p><strong>Producers enqueue with</strong> <code>INSERT INTO WORK_ITEM (OPERATION_ID, PAYLOAD) VALUES (?, ?)</code>.</p></div>
 
 <h3>Check what's in the queue</h3>
 <pre><code>-- How many rows in each state
@@ -474,10 +488,10 @@ SELECT STATUS, COUNT(*) FROM WORK_ITEM GROUP BY STATUS;
 -- Jobs that ran out of attempts, and why
 SELECT OPERATION_ID, ATTEMPTS, LAST_ERROR FROM WORK_ITEM WHERE STATUS = 'FAILED';
 
--- How far behind the queue is: the oldest row that could be claimed right now
+-- How far behind the queue is: when the oldest claimable row became claimable
 SELECT MIN(AVAILABLE_AT) FROM WORK_ITEM WHERE AVAILABLE_AT &lt;= CURRENT TIMESTAMP;
 
--- Leases that ran out (crashed or hung workers), waiting for another worker
+-- Expired leases (crashed or stuck workers) waiting to be claimed again
 SELECT * FROM WORK_ITEM WHERE STATUS = 'CLAIMED' AND AVAILABLE_AT &lt; CURRENT TIMESTAMP;</code></pre>
 
 <h3>What the tests prove</h3>
@@ -495,7 +509,7 @@ SELECT * FROM WORK_ITEM WHERE STATUS = 'CLAIMED' AND AVAILABLE_AT &lt; CURRENT T
 
 </main>
 <footer>
-<p>Source: <a href="../db-work-queue/README.md">README</a> · <a href="../db-work-queue/src/main/java/hle/org/workqueue/WorkQueue.java">WorkQueue.java</a> · <a href="../db-work-queue/src/main/resources/schema.sql">schema.sql</a></p>
+<p>Source: <a href="../db-work-queue/README.md">README</a> · <a href="../db-work-queue/src/main/java/hle/org/workqueue/WorkQueue.java">WorkQueue.java</a> · <a href="../db-work-queue/src/main/java/hle/org/workqueue/App.java">App.java</a> · <a href="../db-work-queue/src/main/resources/schema.sql">schema.sql</a></p>
 </footer>
 </body>
 </html>
